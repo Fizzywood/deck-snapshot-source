@@ -1,0 +1,755 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+APP_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+CLI="$APP_DIR/deck-snapshot"
+KDIALOG_BIN=${KDIALOG:-kdialog}
+RECOVERY_FILE=
+SELECTED_SNAPSHOT=
+UNINSTALLED=0
+QDBUS_BIN=
+PROGRESS_REF=()
+BACKUP_LOCK_FD=
+
+if [[ ! -x "$CLI" ]]; then
+  printf 'Deck Snapshot executable is missing: %s\n' "$CLI" >&2
+  exit 1
+fi
+if ! command -v "$KDIALOG_BIN" >/dev/null 2>&1; then
+  printf 'KDialog is required for the Deck Snapshot desktop interface.\n' >&2
+  exit 1
+fi
+
+dialog() {
+  "$KDIALOG_BIN" --icon deck-snapshot "$@"
+}
+KDIALOG=dialog
+
+find_qdbus() {
+  local candidate
+  if [[ -n "$QDBUS_BIN" ]]; then
+    return 0
+  fi
+  for candidate in qdbus6 qdbus qdbus-qt5; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      QDBUS_BIN=$(command -v "$candidate")
+      return 0
+    fi
+  done
+  return 1
+}
+
+progress_call() {
+  (( ${#PROGRESS_REF[@]} == 2 )) || return 1
+  "$QDBUS_BIN" "${PROGRESS_REF[@]}" "$@" >/dev/null 2>&1
+}
+
+close_progress() {
+  if (( ${#PROGRESS_REF[@]} == 2 )) && [[ -n "$QDBUS_BIN" ]]; then
+    progress_call close || true
+  fi
+  PROGRESS_REF=()
+}
+
+start_progress() {
+  local label=$1 reference
+  close_progress
+  find_qdbus || return 1
+  reference=$("$KDIALOG" --title "Deck Snapshot — Backup" --progressbar "$label" 0) || return 1
+  read -r -a PROGRESS_REF <<<"$reference"
+  if (( ${#PROGRESS_REF[@]} != 2 )) \
+    || [[ ! "${PROGRESS_REF[0]}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
+    || [[ ! "${PROGRESS_REF[1]}" =~ ^/[A-Za-z0-9_/-]+$ ]]; then
+    PROGRESS_REF=()
+    return 1
+  fi
+  if ! progress_call showCancelButton false; then
+    close_progress
+    return 1
+  fi
+}
+
+update_progress() {
+  progress_call setLabelText "$1"
+}
+
+release_backup_lock() {
+  if [[ -n "$BACKUP_LOCK_FD" ]]; then
+    flock -u "$BACKUP_LOCK_FD" >/dev/null 2>&1 || true
+    exec {BACKUP_LOCK_FD}>&-
+    BACKUP_LOCK_FD=
+  fi
+}
+
+begin_backup_lock() {
+  local lock_base lock_directory lock_file old_umask
+  command -v flock >/dev/null 2>&1 || return 1
+  lock_base=${XDG_RUNTIME_DIR:-"$HOME/.cache"}
+  if [[ "$lock_base" != /* || "$lock_base" == *$'\n'* || "$lock_base" == *$'\r'* ]]; then
+    return 1
+  fi
+  if [[ "$lock_base" == "$HOME/.cache" && ! -e "$lock_base" ]]; then
+    mkdir -m 0700 -- "$lock_base" 2>/dev/null || true
+  fi
+  if [[ ! -d "$lock_base" || -L "$lock_base" ]]; then
+    return 1
+  fi
+  lock_directory="$lock_base/deck-snapshot"
+  if [[ ! -e "$lock_directory" ]]; then
+    mkdir -m 0700 -- "$lock_directory" 2>/dev/null || true
+  fi
+  if [[ ! -d "$lock_directory" || -L "$lock_directory" \
+    || $(stat -c '%u' "$lock_directory" 2>/dev/null) != $(id -u) ]]; then
+    return 1
+  fi
+  chmod 0700 -- "$lock_directory" 2>/dev/null || return 1
+  lock_file="$lock_directory/backup.lock"
+  if [[ -L "$lock_file" || ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
+    return 1
+  fi
+  old_umask=$(umask)
+  umask 077
+  exec {BACKUP_LOCK_FD}>>"$lock_file"
+  umask "$old_umask"
+  chmod 0600 -- "$lock_file" 2>/dev/null || { release_backup_lock; return 1; }
+  if ! flock -n "$BACKUP_LOCK_FD"; then
+    release_backup_lock
+    return 2
+  fi
+}
+
+cleanup_ui() {
+  close_progress
+  release_backup_lock
+}
+trap cleanup_ui EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+settings_output=$("$CLI" settings show 2>/dev/null || true)
+saved_recovery=$(printf '%s\n' "$settings_output" | sed -n 's/^Cloud recovery file: //p' | head -n 1)
+if [[ -n "$saved_recovery" && "$saved_recovery" != "not selected" && -f "$saved_recovery" ]]; then
+  RECOVERY_FILE=$saved_recovery
+fi
+unset saved_recovery settings_output
+
+show_output() {
+  local title=$1
+  local value=$2
+  "$KDIALOG" --title "$title" --msgbox "$value"
+}
+
+show_error() {
+  local value=$1
+  "$KDIALOG" --title "Deck Snapshot" --error "$value"
+}
+
+ensure_recovery_file() {
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+    return 0
+  fi
+  RECOVERY_FILE=$("$KDIALOG" --title "Deck Snapshot recovery" --getopenfilename "$HOME" '*.json|Deck Snapshot recovery files') || return 1
+	if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+		"$CLI" settings set --recovery-file "$RECOVERY_FILE" >/dev/null 2>&1 || true
+		return 0
+	fi
+	return 1
+}
+
+cloud_command() {
+  local output action
+  action=$1
+  shift
+  if ! ensure_recovery_file; then
+    return 1
+  fi
+  if output=$("$CLI" cloud "$action" --recovery-file "$RECOVERY_FILE" "$@" 2>&1); then
+    show_output "Deck Snapshot" "$output"
+    return 0
+  fi
+  if "$KDIALOG" --title "Deck Snapshot" --warningyesno "The Google Drive operation failed safely. Local snapshots were not removed.\n\nView redacted technical details?"; then
+    show_output "Google Drive details" "$output"
+  fi
+  return 1
+}
+
+create_recovery() {
+  local destination output
+  destination=$("$KDIALOG" --title "Save recovery material" --getsavefilename "$HOME/deck-snapshot-recovery.json" '*.json|JSON files') || return
+  [[ -n "$destination" ]] || return
+  if output=$("$CLI" cloud recovery create --output "$destination" 2>&1); then
+    RECOVERY_FILE=$destination
+    show_output "Recovery material created" "$output"
+  else
+    show_error "$output"
+  fi
+}
+
+connect_cloud() {
+  local output
+  if ! ensure_recovery_file; then
+    return
+  fi
+  "$KDIALOG" --title "Connect Google Drive" --msgbox "Your system browser will open for Google authorization. Deck Snapshot requests only access to files it creates and stores snapshots at My Drive/Deck Snapshot/Snapshots/."
+  if output=$("$CLI" cloud connect --recovery-file "$RECOVERY_FILE" 2>&1); then
+    show_output "Google Drive connected" "$output"
+  else
+    show_error "$output"
+  fi
+}
+
+disconnect_cloud() {
+  local output password
+  if ! ensure_recovery_file; then
+    return 1
+  fi
+  if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && ! -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+    password=$("$KDIALOG" --title "Preserve v0.1.0 cloud connection" --password "Enter the existing cloud configuration password once so the legacy connection can be verified and preserved locally before disconnecting:") || return 1
+    if (( ${#password} < 12 )); then
+      password=
+      show_error "The existing cloud configuration password must contain at least 12 characters."
+      return 1
+    fi
+    if ! output=$(printf '%s\n' "$password" | "$CLI" cloud disconnect --legacy-password-stdin --recovery-file "$RECOVERY_FILE" 2>&1); then
+      password=
+      if "$KDIALOG" --title "Disconnect unavailable" --warningyesno "The legacy connection could not be verified and preserved safely. Nothing was disconnected or deleted.\n\nView redacted technical details?"; then
+        show_output "Disconnect details" "$output"
+      fi
+      return 1
+    fi
+    password=
+  elif ! output=$("$CLI" cloud disconnect --recovery-file "$RECOVERY_FILE" 2>&1); then
+    if "$KDIALOG" --title "Disconnect unavailable" --warningyesno "The local connection could not be forgotten safely. No cloud or local snapshot was removed.\n\nView redacted technical details?"; then
+      show_output "Disconnect details" "$output"
+    fi
+    return 1
+  fi
+  show_output "Google Drive disconnected locally" "$output"
+}
+
+connect_or_reconnect_cloud() {
+  if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" ]]; then
+    if ! "$KDIALOG" --title "Reconnect Google Drive" --warningyesno "Reconnect by forgetting the current local authorization and opening Google again? Cloud snapshots, local snapshots, and separate recovery material will not be removed."; then
+      return
+    fi
+    if ! disconnect_cloud; then
+      return
+    fi
+  fi
+  connect_cloud
+}
+
+unlock_legacy_cloud() {
+  local password output
+  if ! ensure_recovery_file; then
+    return
+  fi
+  password=$("$KDIALOG" --title "Unlock v0.1.0 cloud connection" --password "Enter your existing Deck Snapshot cloud configuration password once:") || return
+  if (( ${#password} < 12 )); then
+    show_error "The existing cloud configuration password must contain at least 12 characters."
+    return
+  fi
+  if output=$(printf '%s\n' "$password" | "$CLI" cloud unlock --recovery-file "$RECOVERY_FILE" 2>&1); then
+    show_output "Cloud connection unlocked" "$output"
+  else
+    show_error "$output"
+  fi
+  password=
+}
+
+create_snapshot() {
+  local output snapshot_path settings upload_output storage_state cloud_note cloud_display result_title lock_status
+  local cloud_expected=false upload_failed=false
+  begin_backup_lock
+  lock_status=$?
+  if (( lock_status == 2 )); then
+    show_error "Another backup is already running. Wait for it to finish, then try again."
+    return
+  fi
+  if (( lock_status != 0 )); then
+    show_error "Deck Snapshot could not create a safe private backup lock. No backup was started."
+    return
+  fi
+  if ! start_progress "Creating and validating the local backup…"; then
+    release_backup_lock
+    show_error "Deck Snapshot could not show reliable backup progress. No backup was started."
+    return
+  fi
+  if output=$("$CLI" snapshot create 2>&1); then
+    snapshot_path=$(printf '%s\n' "$output" | sed -n 's/^Snapshot created and validated: //p' | head -n 1)
+    storage_state="Local only"
+    cloud_note="Not uploaded"
+    settings=$("$CLI" settings show 2>/dev/null || true)
+    if printf '%s\n' "$settings" | grep -Fx 'Automatic cloud upload: true' >/dev/null \
+      && [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+      cloud_expected=true
+      if [[ -n "$snapshot_path" && -f "$snapshot_path" ]]; then
+        close_progress
+        if ! ensure_recovery_file; then
+          cloud_note="Recovery file required"
+        elif ! start_progress "Uploading the protected backup to Google Drive…"; then
+          cloud_note="Upload not started because progress could not be displayed"
+        else
+          while true; do
+            if upload_output=$("$CLI" cloud upload --recovery-file "$RECOVERY_FILE" "$snapshot_path" 2>&1); then
+              storage_state="Local + Cloud"
+              cloud_note="Stored"
+              upload_failed=false
+              break
+            fi
+            cloud_note="Upload failed"
+            upload_failed=true
+            close_progress
+            if ! "$KDIALOG" --title "Cloud upload failed" --warningyesno "The local backup is safe. Retry the Google Drive upload now?"; then
+              break
+            fi
+            if ! start_progress "Retrying the protected Google Drive upload…"; then
+              cloud_note="Retry not started because progress could not be displayed"
+              break
+            fi
+          done
+          close_progress
+          if [[ "$upload_failed" == true ]] && "$KDIALOG" --title "Cloud upload details" --yesno "View redacted technical details?"; then
+            show_output "Cloud upload details" "$upload_output"
+          fi
+        fi
+      else
+        cloud_note="Local backup path unavailable for upload"
+      fi
+    elif [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" ]]; then
+      cloud_note="Automatic upload is off"
+    else
+      cloud_note="Not connected"
+    fi
+    close_progress
+    release_backup_lock
+    result_title="Backup complete"
+    if [[ "$cloud_expected" == true && "$storage_state" != "Local + Cloud" ]]; then
+      result_title="Backup created locally"
+    fi
+    case "$cloud_note" in
+      Stored) cloud_display="✓ Stored" ;;
+      "Upload failed") cloud_display="! Upload failed" ;;
+      *) cloud_display="— $cloud_note" ;;
+    esac
+    show_output "$result_title" "Local              ✓ Saved\nGoogle Drive       $cloud_display"
+  else
+    close_progress
+    release_backup_lock
+    if "$KDIALOG" --title "Backup unavailable" --warningyesno "Deck Snapshot could not create a validated backup. No partial backup was published.\n\nView redacted technical details?"; then
+      show_output "Backup details" "$output"
+    fi
+  fi
+}
+
+choose_snapshot() {
+  local purpose=${1:-Snapshots}
+  local directory file key choice path output name local_mark cloud_mark legacy_mark label display_time location_label timestamp
+  local -a entries=() legacy_option=() names=() sorted_names=()
+  local -A local_seen=() cloud_seen=() legacy_seen=() all_seen=()
+  SELECTED_SNAPSHOT=
+  directory="$HOME/.local/share/deck-snapshot/snapshots"
+  shopt -s nullglob
+  for file in "$directory"/*.tar.gz; do
+    name=${file##*/}
+    local_seen["$name"]=1
+    if [[ -z "${all_seen[$name]:-}" ]]; then names+=("$name"); all_seen["$name"]=1; fi
+  done
+  shopt -u nullglob
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+    if output=$("$CLI" cloud list --recovery-file "$RECOVERY_FILE" 2>/dev/null); then
+      while IFS=' ' read -r name _; do
+        if [[ "$name" =~ ^deck-snapshot-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+          cloud_seen["$name"]=1
+          if [[ -z "${all_seen[$name]:-}" ]]; then names+=("$name"); all_seen["$name"]=1; fi
+        fi
+      done <<<"$output"
+    fi
+  fi
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/config-password" ]]; then
+    if output=$("$CLI" cloud list --legacy --recovery-file "$RECOVERY_FILE" 2>/dev/null); then
+      while IFS=' ' read -r name _; do
+        if [[ "$name" =~ ^deck-snapshot-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+          legacy_seen["$name"]=1
+          if [[ -z "${all_seen[$name]:-}" ]]; then names+=("$name"); all_seen["$name"]=1; fi
+        fi
+      done <<<"$output"
+    fi
+  fi
+  if (( ${#names[@]} == 0 )); then
+    show_output "$purpose" "No local or available Google Drive backups were found."
+    return 1
+  fi
+  mapfile -t sorted_names < <(printf '%s\n' "${names[@]}" | sort -r)
+  for name in "${sorted_names[@]}"; do
+    local_mark="—"
+    cloud_mark="—"
+    legacy_mark="—"
+    [[ -n "${local_seen[$name]:-}" ]] && local_mark="✓"
+    [[ -n "${cloud_seen[$name]:-}" ]] && cloud_mark="✓"
+    [[ -n "${legacy_seen[$name]:-}" ]] && legacy_mark="✓"
+    if [[ "$local_mark" == "✓" ]]; then
+      key="local"
+    elif [[ "$cloud_mark" == "✓" ]]; then
+      key="cloud"
+    else
+      key="legacy"
+    fi
+    label="$name — Local $local_mark · Google Drive $cloud_mark · Legacy $legacy_mark"
+    display_time=$name
+    if [[ "$name" =~ ^deck-snapshot-([0-9]{8}T[0-9]{6}Z)- ]]; then
+      timestamp=${BASH_REMATCH[1]}
+      display_time=$(date -u -d "${timestamp:0:8} ${timestamp:9:6}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || printf '%s' "$timestamp")
+    fi
+    location_label=
+    [[ -n "${local_seen[$name]:-}" ]] && location_label="Local"
+    [[ -n "${cloud_seen[$name]:-}" ]] && location_label+="${location_label:+ + }Google Drive"
+    [[ -n "${legacy_seen[$name]:-}" ]] && location_label+="${location_label:+ + }v0.1.0 cloud"
+    label="$display_time — $location_label"
+    entries+=("$key:$name" "$label")
+  done
+  choice=$("$KDIALOG" --title "Deck Snapshot — $purpose" --menu "Choose a backup:" "${entries[@]}") || return
+  key=${choice%%:*}
+  name=${choice#*:}
+  if [[ "$key" == "cloud" || "$key" == "legacy" ]]; then
+    legacy_option=()
+    if [[ "$key" == "legacy" ]]; then legacy_option=(--legacy); fi
+    if ! output=$("$CLI" cloud download "${legacy_option[@]}" --recovery-file "$RECOVERY_FILE" "$name" 2>&1); then
+      if "$KDIALOG" --title "Snapshot download failed" --warningyesno "The cloud snapshot could not be downloaded and validated. No local snapshot was replaced.\n\nView redacted technical details?"; then
+        show_output "Snapshot download details" "$output"
+      fi
+      return
+    fi
+    path=$(printf '%s\n' "$output" | sed -n 's/^Protected snapshot downloaded and validated: //p' | head -n 1)
+  else
+    path="$directory/$name"
+  fi
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    show_error "The selected snapshot could not be prepared safely."
+    return 1
+  fi
+  SELECTED_SNAPSHOT=$path
+}
+
+snapshot_browser() {
+  local output
+  if ! choose_snapshot "Snapshots"; then
+    return
+  fi
+  if ! output=$("$CLI" snapshot inspect "$SELECTED_SNAPSHOT" 2>&1); then
+    show_error "$output"
+    return
+  fi
+  show_output "Snapshot details" "$output"
+}
+
+list_local() {
+  local output
+  if output=$("$CLI" snapshot list 2>&1); then
+    show_output "Local snapshots" "$output"
+  else
+    show_error "$output"
+  fi
+}
+
+upload_snapshot() {
+  local path
+  path=$("$KDIALOG" --title "Upload protected snapshot" --getopenfilename "$HOME/.local/share/deck-snapshot/snapshots" '*.tar.gz|Deck Snapshot archives') || return
+  [[ -n "$path" ]] || return
+  cloud_command upload "$path"
+}
+
+download_snapshot() {
+  local name
+  name=$("$KDIALOG" --title "Download protected snapshot" --inputbox "Enter the exact cloud snapshot name. Use 'List cloud snapshots' first.") || return
+  [[ -n "$name" ]] || return
+  cloud_command download "$name"
+}
+
+plan_restore_path() {
+  local snapshot output plan_path plan_id approval_hash run_output details_output
+  snapshot=$1
+  if ! output=$("$CLI" restore plan "$snapshot" 2>&1); then
+    if "$KDIALOG" --title "Restore plan unavailable" --warningyesno "Deck Snapshot could not create a safe restore plan. No production files were modified.\n\nView redacted technical details?"; then
+      show_output "Restore plan details" "$output"
+    fi
+    return
+  fi
+  show_output "Restore dry-run plan" "$output"
+  plan_path=$(printf '%s\n' "$output" | sed -n 's/^Restore plan created without target writes: //p' | head -n 1)
+  plan_id=$(printf '%s\n' "$output" | sed -n 's/^Plan ID: //p' | head -n 1)
+  approval_hash=$(printf '%s\n' "$output" | sed -n 's/^Approval hash: //p' | head -n 1)
+  if [[ -z "$plan_path" || ! "$plan_id" =~ ^[A-Za-z0-9._-]+$ || ! "$approval_hash" =~ ^[a-f0-9]{64}$ ]]; then
+    show_error "The generated restore approval could not be parsed safely. No restore was started."
+    return
+  fi
+  if printf '%s\n' "$output" | grep -Fx 'Blocking: true' >/dev/null; then
+    show_error "This restore plan is blocked. No restore can be started until every blocking item is resolved."
+    return
+  fi
+  if "$KDIALOG" --title "Review exact restore actions" --yesno "View every planned file and plugin action before deciding?"; then
+    if ! details_output=$("$CLI" restore inspect --details "$plan_path" 2>&1); then
+      show_error "The saved plan could not be reloaded safely. No restore was started."
+      return
+    fi
+    show_output "Exact restore actions" "$details_output"
+  fi
+  if ! "$KDIALOG" --title "Confirm exact restore" --warningyesno "Run exact plan $plan_id?\n\nApproval SHA-256:\n$approval_hash\n\nA verified recovery snapshot is created before any production change."; then
+    return
+  fi
+  "$KDIALOG" --title "Deck Snapshot" --passivepopup "Running the approved restore transaction..." 4
+  if run_output=$("$CLI" restore run --approve "$plan_id" --approval-hash "$approval_hash" "$plan_path" 2>&1); then
+    show_output "Restore completed" "$run_output"
+  else
+    if "$KDIALOG" --title "Restore did not complete" --warningyesno "The restore did not complete successfully. Keep any reported recovery snapshot and restore report.\n\nView redacted technical details?"; then
+      show_output "Restore details" "$run_output"
+    fi
+  fi
+}
+
+plan_restore() {
+  if ! choose_snapshot "Restore"; then
+    return
+  fi
+  plan_restore_path "$SELECTED_SNAPSHOT"
+}
+
+settings_dialog() {
+  local output auto current
+  output=$("$CLI" settings show 2>&1) || { show_error "$output"; return; }
+  auto=false
+  printf '%s\n' "$output" | grep -Fx 'Automatic cloud upload: true' >/dev/null && auto=true
+  current="Off"
+  [[ "$auto" == true ]] && current="On"
+  if "$KDIALOG" --title "Settings" --yesno "Upload validated backups to Google Drive automatically?\n\nCurrent: $current\n\nLocal backups are always kept."; then
+    auto=true
+  else
+    auto=false
+  fi
+  if output=$("$CLI" settings set --auto-upload "$auto" 2>&1); then
+    current="Off"
+    [[ "$auto" == true ]] && current="On"
+    show_output "Settings saved" "Automatic Google Drive upload: $current\nLocal backups: Always kept"
+  else
+    show_error "$output"
+  fi
+}
+
+dashboard_summary() {
+  local version latest latest_path latest_time latest_epoch latest_date today yesterday cloud stored decky plugin_count status_output list_output
+  version=$("$CLI" version 2>/dev/null | head -n 1)
+  version=${version#Deck Snapshot }
+  if [[ "$version" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-dev\. ]]; then
+    version="${BASH_REMATCH[1]} development build"
+  fi
+  latest="None"
+  latest_path=
+  shopt -s nullglob
+  for file in "$HOME/.local/share/deck-snapshot/snapshots"/*.tar.gz; do
+    latest=${file##*/}
+    latest_path=$file
+  done
+  shopt -u nullglob
+  latest_time="No backup yet"
+  if [[ -n "$latest_path" ]]; then
+    latest_epoch=$(stat -c '%Y' "$latest_path" 2>/dev/null || true)
+    latest_date=$(date -d "@$latest_epoch" '+%Y-%m-%d' 2>/dev/null || true)
+    today=$(date '+%Y-%m-%d')
+    yesterday=$(date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null || true)
+    if [[ "$latest_date" == "$today" ]]; then
+      latest_time=$(date -d "@$latest_epoch" '+Today · %H:%M' 2>/dev/null || printf '%s' "$latest")
+    elif [[ "$latest_date" == "$yesterday" ]]; then
+      latest_time=$(date -d "@$latest_epoch" '+Yesterday · %H:%M' 2>/dev/null || printf '%s' "$latest")
+    else
+      latest_time=$(date -d "@$latest_epoch" '+%Y-%m-%d · %H:%M' 2>/dev/null || printf '%s' "$latest")
+    fi
+  fi
+  plugin_count=0
+  if [[ -d "$HOME/homebrew/plugins" ]]; then
+    shopt -s nullglob
+    for file in "$HOME/homebrew/plugins"/*; do
+      [[ -d "$file" && ! -L "$file" ]] && plugin_count=$((plugin_count + 1))
+    done
+    shopt -u nullglob
+    decky="✓ $plugin_count plugins"
+  else
+    decky="! Not detected"
+  fi
+  cloud="— Not connected"
+  stored="— No backup yet"
+  if [[ "$latest" != "None" ]]; then
+    stored="✓ Local only"
+  fi
+  if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+    if [[ -z "$RECOVERY_FILE" || ! -f "$RECOVERY_FILE" ]]; then
+      cloud="! Recovery file required"
+    elif status_output=$("$CLI" cloud status --recovery-file "$RECOVERY_FILE" 2>&1); then
+      if printf '%s\n' "$status_output" | grep -Fx 'Cloud connected: true' >/dev/null; then
+        cloud="✓ Connected"
+        if [[ "$latest" != "None" ]] && list_output=$("$CLI" cloud list --recovery-file "$RECOVERY_FILE" 2>/dev/null) \
+          && printf '%s\n' "$list_output" | grep -F "${latest}  " >/dev/null; then
+          stored="✓ Local + Cloud"
+        fi
+      else
+        cloud="! Reconnect required"
+      fi
+    else
+      if printf '%s\n' "$status_output" | grep -Eqi 'authoriz|invalid.grant|token.*(expired|revoked|invalid)|oauth'; then
+        cloud="! Reconnect required"
+      else
+        cloud="! Connection problem"
+      fi
+    fi
+  fi
+  printf '<table width="420" cellspacing="0" cellpadding="2"><tr><td align="left"><b>Deck Snapshot</b></td><td align="right">%s</td></tr><tr><td colspan="2">&nbsp;</td></tr><tr><td align="left">Google Drive</td><td align="right">%s</td></tr><tr><td align="left">Decky</td><td align="right">%s</td></tr><tr><td align="left">Last backup</td><td align="right">%s</td></tr><tr><td align="left">Stored</td><td align="right">%s</td></tr><tr><td colspan="2">&nbsp;</td></tr><tr><td align="left">Updates</td><td align="right">No automatic updates</td></tr></table>' "$version" "$cloud" "$decky" "$latest_time" "$stored"
+}
+
+diagnostics() {
+  local output cloud_output report steam decky google cloud_folder storage disk available_kb available_gib
+  if ! output=$("$CLI" doctor 2>&1); then
+    if "$KDIALOG" --title "Diagnostics unavailable" --warningyesno "Diagnostics could not complete safely.\n\nView redacted technical details?"; then
+      show_output "Diagnostics details" "$output"
+    fi
+    return
+  fi
+  steam="! Needs attention"
+  decky="! Needs attention"
+  google="— Not connected"
+  cloud_folder="— Not connected"
+  storage="— No backups yet"
+  disk="! Unavailable"
+  printf '%s\n' "$output" | grep -Fx 'Steam detected: true' >/dev/null && steam="✓ Ready"
+  printf '%s\n' "$output" | grep -Fx 'Decky detected: true' >/dev/null && decky="✓ Ready"
+  [[ -d "$HOME/.local/share/deck-snapshot/snapshots" ]] && storage="✓ Available"
+  available_kb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
+    available_gib=$((available_kb / 1048576))
+    disk="✓ ${available_gib} GiB free"
+  fi
+  report=$output
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+    if cloud_output=$("$CLI" cloud status --recovery-file "$RECOVERY_FILE" 2>&1); then
+      if printf '%s\n' "$cloud_output" | grep -Fx 'Cloud connected: true' >/dev/null; then
+        google="✓ Connected"
+      else
+        google="! Reconnect required"
+      fi
+      if printf '%s\n' "$cloud_output" | grep -Fx 'Snapshot folder: My Drive/Deck Snapshot/Snapshots' >/dev/null; then
+        cloud_folder="✓ Available"
+      fi
+    else
+      google="! Reconnect required"
+      cloud_folder="! Unavailable"
+    fi
+    report="$output
+
+Live Google Drive check:
+$cloud_output"
+  fi
+  show_output "Diagnostics" "Steam               $steam\nDecky               $decky\nGoogle Drive        $google\nCloud folder        $cloud_folder\nSnapshot storage    $storage\nDisk space          $disk"
+  if "$KDIALOG" --title "Diagnostics" --yesno "View the redacted technical report?"; then
+    show_output "Diagnostics report" "$report"
+  fi
+}
+
+uninstall_application() {
+  local output
+  if ! "$KDIALOG" --title "Uninstall Deck Snapshot" --warningyesno "Remove the Deck Snapshot application and launcher? Snapshots, reports, cloud configuration, and recovery material will be preserved."; then
+    return
+  fi
+  if output=$("$APP_DIR/uninstall.sh" 2>&1); then
+    show_output "Deck Snapshot uninstalled" "$output"
+    UNINSTALLED=1
+  else
+    show_error "$output"
+  fi
+}
+
+cloud_advanced_menu() {
+  local choice
+  choice=$("$KDIALOG" --title "Google Drive — Advanced" --menu "Advanced cloud actions:" \
+    cloudlist "List protected cloud backups" \
+    upload "Upload an existing local backup" \
+    download "Download by exact backup name" \
+    unlock "Unlock a v0.1.0 cloud connection" \
+    disconnect "Disconnect Google Drive locally" \
+    back "Back") || return
+  case "$choice" in
+    cloudlist) cloud_command list ;;
+    upload) upload_snapshot ;;
+    download) download_snapshot ;;
+    unlock) unlock_legacy_cloud ;;
+    disconnect) disconnect_cloud ;;
+    back) return ;;
+  esac
+}
+
+cloud_menu() {
+  local choice
+  choice=$("$KDIALOG" --title "Google Drive" --menu "Google Drive options:" \
+    connect "Connect or reconnect" \
+    status "Check connection" \
+    recovery "Create recovery material" \
+    advanced "Advanced actions" \
+    back "Back") || return
+  case "$choice" in
+    connect) connect_or_reconnect_cloud ;;
+    status) cloud_command status ;;
+    recovery) create_recovery ;;
+    advanced) cloud_advanced_menu ;;
+    back) return ;;
+  esac
+}
+
+application_menu() {
+  local choice version
+  choice=$("$KDIALOG" --title "Deck Snapshot" --menu "Application options:" \
+    about "About and updates" \
+    uninstall "Uninstall Deck Snapshot" \
+    back "Back") || return
+  case "$choice" in
+    about)
+      version=$("$CLI" version 2>/dev/null | head -n 1)
+      show_output "About Deck Snapshot" "$version\n\nDeck Snapshot does not download or install updates automatically. To update, download the newest installer from the verified public release page and open it. Your backups and settings are kept."
+      ;;
+    uninstall) uninstall_application ;;
+    back) return ;;
+  esac
+}
+
+more_menu() {
+  local choice
+  choice=$("$KDIALOG" --title "More options" --menu "Choose a category:" \
+    cloud "Google Drive" \
+    application "Application" \
+    back "Back") || return
+  case "$choice" in
+    cloud) cloud_menu ;;
+    application) application_menu ;;
+    back) return ;;
+  esac
+}
+
+while true; do
+  summary=$(dashboard_summary)
+  choice=$("$KDIALOG" --title "Deck Snapshot" --menu "$summary<br><br><b>What would you like to do?</b>" \
+    create "Create Backup" \
+    restore "Restore" \
+    snapshots "Snapshots" \
+    settings "Settings" \
+    doctor "Diagnostics" \
+    more "More options" \
+    quit "Quit") || break
+  case "$choice" in
+    create) create_snapshot ;;
+    restore) plan_restore ;;
+    snapshots) snapshot_browser ;;
+    settings) settings_dialog ;;
+    doctor) diagnostics ;;
+    more) more_menu ;;
+    quit) break ;;
+  esac
+  if (( UNINSTALLED == 1 )); then
+    break
+  fi
+done

@@ -1,0 +1,10 @@
+{
+  "name": "Fixture Theme",
+  "display_name": "Fixture Theme",
+  "version": "1.0.0",
+  "manifest_version": 9,
+  "inject": {
+    "shared.css": ["SP"]
+  },
+  "patches": {}
+}

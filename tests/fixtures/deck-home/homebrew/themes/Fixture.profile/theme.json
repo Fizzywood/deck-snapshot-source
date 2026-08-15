@@ -1,0 +1,9 @@
+{
+  "name": "Fixture Profile",
+  "version": "1.0.0",
+  "manifest_version": 9,
+  "flags": ["PRESET"],
+  "dependencies": {
+    "Fixture Theme": {}
+  }
+}

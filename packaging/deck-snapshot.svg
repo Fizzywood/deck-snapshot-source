@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Deck Snapshot</title>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#2563eb"/>
+  <rect x="17" y="15" width="32" height="26" rx="6" fill="#bfdbfe"/>
+  <rect x="13" y="23" width="36" height="28" rx="7" fill="#ffffff"/>
+  <path d="M24 34a10 10 0 0 1 17-3" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+  <path d="m39 26 4 6-7 1" fill="#2563eb"/>
+  <path d="M40 41a10 10 0 0 1-17 2" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+  <path d="m25 48-4-6 7-1" fill="#2563eb"/>
+</svg>

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Deck Snapshot
+Comment=Back up and safely restore Steam Deck customization
+Exec="@APP_DIR@/deck-snapshot-ui"
+Icon=deck-snapshot
+Terminal=false
+Categories=Utility;System;
+StartupNotify=true

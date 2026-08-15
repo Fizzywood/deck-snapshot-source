@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install Deck Snapshot @VERSION@
+Comment=Download, verify, and install Deck Snapshot for this user
+Icon=system-software-install
+Terminal=false
+Categories=Utility;System;
+Exec=/usr/bin/env bash -c "echo @PAYLOAD@ | base64 -d | bash"

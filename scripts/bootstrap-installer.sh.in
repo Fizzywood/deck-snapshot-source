@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=@VERSION@
+EXPECTED_ARCHIVE_SHA256=@ARCHIVE_SHA256@
+if [[ "$HOME" != /* || "$HOME" == *$'\n'* || "$HOME" == *$'\r'* ]]; then
+  printf 'The home directory is not safe for installation.\n' >&2
+  exit 1
+fi
+
+LOCK_BASE=${XDG_RUNTIME_DIR:-"$HOME/.cache"}
+if [[ "$LOCK_BASE" != /* || "$LOCK_BASE" == *$'\n'* || "$LOCK_BASE" == *$'\r'* ]]; then
+  printf 'The installer lock directory is not safe.\n' >&2
+  exit 1
+fi
+if [[ "$LOCK_BASE" == "$HOME/.cache" && ! -e "$LOCK_BASE" ]]; then
+  mkdir -m 0700 -- "$LOCK_BASE" 2>/dev/null || true
+fi
+if [[ ! -d "$LOCK_BASE" || -L "$LOCK_BASE" ]]; then
+  printf 'The installer lock directory is missing or unsafe.\n' >&2
+  exit 1
+fi
+LOCK_DIRECTORY="$LOCK_BASE/deck-snapshot"
+if [[ ! -e "$LOCK_DIRECTORY" ]]; then
+  mkdir -m 0700 -- "$LOCK_DIRECTORY" 2>/dev/null || true
+fi
+if [[ ! -d "$LOCK_DIRECTORY" || -L "$LOCK_DIRECTORY" || $(stat -c '%u' "$LOCK_DIRECTORY") != $(id -u) ]]; then
+  printf 'The installer lock directory is missing or unsafe.\n' >&2
+  exit 1
+fi
+chmod 0700 -- "$LOCK_DIRECTORY"
+LOCK_FILE="$LOCK_DIRECTORY/installer.lock"
+if [[ -L "$LOCK_FILE" || ( -e "$LOCK_FILE" && ! -f "$LOCK_FILE" ) ]]; then
+  printf 'The installer lock is unsafe.\n' >&2
+  exit 1
+fi
+umask 077
+exec 9>>"$LOCK_FILE"
+chmod 0600 -- "$LOCK_FILE"
+if ! command -v flock >/dev/null 2>&1; then
+  printf 'The required installer locking utility is unavailable.\n' >&2
+  exit 1
+fi
+if ! flock -n 9; then
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "Deck Snapshot" --error "Another Deck Snapshot installer is already running. Wait for it to finish, then try again."
+  else
+    printf 'Another Deck Snapshot installer is already running.\n' >&2
+  fi
+  exit 0
+fi
+
+WORK_DIRECTORY=$(mktemp -d)
+INSTALL_SUCCEEDED=0
+
+cleanup() {
+  local status=$1
+  cd /
+  rm -rf -- "$WORK_DIRECTORY"
+  if (( status != 0 && INSTALL_SUCCEEDED == 0 )) && command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "Deck Snapshot" --error "Deck Snapshot $VERSION could not be downloaded, verified, or installed. No system files were changed."
+  fi
+}
+trap 'cleanup "$?"' EXIT
+
+BASE_URL="https://github.com/Fizzywood/deck-snapshot-releases/releases/download/$VERSION"
+ARCHIVE="$WORK_DIRECTORY/deck-snapshot-linux-amd64.tar.gz"
+CHECKSUM="$WORK_DIRECTORY/deck-snapshot-linux-amd64.sha256"
+LISTING="$WORK_DIRECTORY/archive.list"
+
+copy_local_release_assets() {
+  local configured_download download_directory resolved_archive resolved_checksum resolved_download resolved_home
+  download_directory="$HOME/Downloads"
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    configured_download=$(xdg-user-dir DOWNLOAD 2>/dev/null || true)
+    if [[ -n "$configured_download" ]]; then
+      download_directory=$configured_download
+    fi
+  fi
+  if [[ "$download_directory" != /* || "$download_directory" == *$'\n'* || "$download_directory" == *$'\r'* ]]; then
+    return 1
+  fi
+  resolved_home=$(realpath "$HOME") || return 1
+  resolved_download=$(realpath "$download_directory") || return 1
+  case "$resolved_download" in
+    "$resolved_home"|"$resolved_home"/*) ;;
+    *) return 1 ;;
+  esac
+  local local_archive="$download_directory/deck-snapshot-linux-amd64.tar.gz"
+  local local_checksum="$download_directory/deck-snapshot-linux-amd64.sha256"
+  if [[ ! -f "$local_archive" || -L "$local_archive" || ! -f "$local_checksum" || -L "$local_checksum" ]]; then
+    return 1
+  fi
+  resolved_archive=$(realpath "$local_archive") || return 1
+  resolved_checksum=$(realpath "$local_checksum") || return 1
+  case "$resolved_archive" in "$resolved_download"/*) ;; *) return 1 ;; esac
+  case "$resolved_checksum" in "$resolved_download"/*) ;; *) return 1 ;; esac
+  install -m 0600 -- "$local_archive" "$ARCHIVE"
+  install -m 0600 -- "$local_checksum" "$CHECKSUM"
+}
+
+if copy_local_release_assets; then
+  printf 'Using matching release assets from the local Downloads directory.\n'
+else
+  curl --fail --location --proto '=https' --tlsv1.2 --output "$ARCHIVE" "$BASE_URL/deck-snapshot-linux-amd64.tar.gz"
+  curl --fail --location --proto '=https' --tlsv1.2 --output "$CHECKSUM" "$BASE_URL/deck-snapshot-linux-amd64.sha256"
+fi
+cd -- "$WORK_DIRECTORY"
+test "$(wc -l <"$CHECKSUM")" -eq 1
+grep -Eq '^[0-9a-f]{64}  deck-snapshot-linux-amd64\.tar\.gz$' "$CHECKSUM"
+grep -Fx "$EXPECTED_ARCHIVE_SHA256  deck-snapshot-linux-amd64.tar.gz" "$CHECKSUM" >/dev/null
+sha256sum -c "$CHECKSUM"
+
+tar -tzf "$ARCHIVE" >"$LISTING"
+test "$(wc -l <"$LISTING")" -le 32
+if grep -E '(^/|(^|/)\.\.(/|$)|\\)' "$LISTING"; then
+  printf 'The release archive contains an unsafe path.\n' >&2
+  exit 1
+fi
+unexpected=$(grep -Ev '^deck-snapshot(/|$)' "$LISTING" || true)
+test -z "$unexpected"
+tar -tvzf "$ARCHIVE" | awk 'substr($1,1,1) !~ /[-d]/ { exit 1 }'
+
+tar -xzf "$ARCHIVE"
+bash deck-snapshot/install.sh
+INSTALL_SUCCEEDED=1
+if command -v kdialog >/dev/null 2>&1; then
+  kdialog --title "Deck Snapshot" --msgbox "Deck Snapshot $VERSION was installed successfully." || true
+else
+  printf 'Deck Snapshot %s was installed successfully.\n' "$VERSION"
+fi

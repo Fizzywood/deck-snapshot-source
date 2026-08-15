@@ -1,0 +1,30 @@
+name: Source verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+          shellcheck scripts/deck-snapshot-ui scripts/bootstrap-installer.sh.in scripts/install.sh scripts/uninstall.sh scripts/package-bootstrap-installer.sh scripts/package-release.sh scripts/test-package.sh scripts/test-bootstrap-installer.sh scripts/test-ui.sh
+          bash scripts/test-ui.sh
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o deck-snapshot-linux-amd64 ./cmd/deck-snapshot

@@ -1,0 +1,50 @@
+# Build and test output
+/bin/
+/dist/
+/build/
+/coverage/
+*.out
+*.test
+*.prof
+/deck-snapshot.exe
+
+# Local runtime data and real snapshots
+/snapshots/
+/recovery/
+*.snapshot
+*.snapshot.*
+*.tar
+*.tar.gz
+*.tar.zst
+
+# Secrets and cloud credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*client_secret*.json
+*credentials*.json
+*recovery-key*
+*recovery_key*
+rclone.conf
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local logs, state and temporary files
+*.log
+*.tmp
+*.temp
+/.cache/
+/.local-state/
+/.tools/

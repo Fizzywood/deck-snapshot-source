@@ -1,0 +1,11 @@
+{
+  "name": "Fixture Plugin",
+  "author": "Deck Snapshot Tests",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility"],
+    "description": "Synthetic plugin metadata for tests",
+    "image": "fixture"
+  }
+}
