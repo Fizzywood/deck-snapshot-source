@@ -1,10 +1,36 @@
-# Deck Snapshot Source — v0.1.5
+# Deck Snapshot Source
 
-This public repository contains clean source snapshots corresponding to published Deck Snapshot releases. The `v0.1.5` tag matches the same version in the [official download repository](https://github.com/Fizzywood/deck-snapshot-releases/releases/tag/v0.1.5).
+This repository contains clean, inspectable source snapshots for published Deck Snapshot releases.
 
 **[Download Deck Snapshot](https://github.com/Fizzywood/deck-snapshot-releases/releases/latest)**
 
-Deck Snapshot is a local-first SteamOS tool for backing up and safely restoring supported Decky plugin state, CSS Loader customization, and custom Steam artwork. It is not a system image or a general-purpose backup tool.
+Deck Snapshot is a local-first SteamOS utility for backing up and restoring Steam Deck customization, including:
+
+- Decky plugins and supported plugin state
+- CSS Loader customization
+- custom Steam artwork
+
+It is not a full SteamOS image or a general-purpose backup utility.
+
+## Why is the source public?
+
+Deck Snapshot handles backups, Google Drive access, and restore operations.
+
+The released source is published so users can inspect what the distributed application does and compare releases with the code used to build them.
+
+This repository contains clean release snapshots only.
+
+The private development repository, development history, issues, pull requests, internal coordination, hardware evidence, credentials, real snapshots, and user data are not published here.
+
+## Releases
+
+Each public source tag corresponds to the same Deck Snapshot release in the download repository.
+
+**[Open the Deck Snapshot releases](https://github.com/Fizzywood/deck-snapshot-releases/releases)**
+
+`SOURCE_VERSION` records the matching public release.
+
+`SOURCE_PROVENANCE` records the release version and the exact private release commit used to generate the public source snapshot without exposing the private Git history.
 
 ## Build and test
 
@@ -15,27 +41,52 @@ gofmt -w ./cmd ./internal ./tests
 go vet ./...
 go test ./...
 go test -race ./...
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o deck-snapshot-linux-amd64 ./cmd/deck-snapshot
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+go build -trimpath -o deck-snapshot-linux-amd64 ./cmd/deck-snapshot
 ```
 
-The release binary additionally receives Google's non-confidential Desktop installed-app credential through protected release configuration. The credential is required by Google for the installed-app token exchange, is extractable from the public binary by design, and is never stored in this source snapshot or published as a separate file. The requested scope remains exactly `drive.file`.
+Release builds additionally contain Google's Desktop installed-app OAuth credential through protected release configuration.
 
-## Repository boundaries
+Desktop OAuth client credentials are non-confidential by design and may be extracted from a distributed desktop application. The standalone credential configuration is not published in this repository.
 
-This is a release-source snapshot, not the private development repository. It intentionally excludes private history, issues, pull requests, internal coordination, hardware evidence, credentials, tokens, recovery material, real snapshots, and user data. The source, tests, security contract, packaging scripts, and user documentation needed to inspect and build the released product are included.
+Deck Snapshot currently requests only:
 
-Distribution assets, checksums, installation instructions, and release notes are published at [Fizzywood/deck-snapshot-releases](https://github.com/Fizzywood/deck-snapshot-releases).
+- `drive.file`
+- `drive.appdata`
 
-`SOURCE_VERSION` records the matching public release tag. `SOURCE_PROVENANCE` records that version and the exact private release commit used to generate this clean source snapshot, without exposing private Git history.
+These permissions are used for Deck Snapshot's own Drive files and private recovery data.
+
+## Security
+
+Cloud snapshots are encrypted client-side before upload.
+
+Recovery information is stored in Deck Snapshot's private Google Drive app-data area so that encrypted backups can be recovered after reinstalling SteamOS by connecting the same Google account.
+
+The same-account recovery model is not zero-knowledge protection against full compromise of that Google account.
+
+Restore operations use snapshot validation, explicit planning, confirmation, path restrictions, and recovery safeguards.
+
+For the detailed security contract, see [SECURITY.md](SECURITY.md).
 
 ## Licensing
 
-Deck Snapshot is source-available for transparency and inspection. It is all rights reserved and is not an open-source project. No permission to reuse, modify, or redistribute Deck Snapshot is granted. See [LICENSE](LICENSE). Third-party components retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the applicable dependency metadata.
+Deck Snapshot is **source-available for transparency and inspection**.
 
-## AI-assisted development disclosure
+It is **not an open-source project**.
 
-Deck Snapshot was substantially designed and implemented with OpenAI Codex under human product ownership, a development approach sometimes called vibe coding. Releases are still subject to automated tests, focused security review, checksum verification, and real Steam Deck validation. AI assistance and testing do not guarantee that the software is error-free; keep independent copies of important data and review every restore plan.
+All rights are reserved. No permission to reuse, modify, or redistribute Deck Snapshot is granted unless explicitly stated otherwise.
 
-Security-sensitive behavior is governed by [SECURITY.md](SECURITY.md). Do not publish credentials, recovery material, snapshot contents, or private paths in a public issue.
+See [LICENSE](LICENSE).
 
-Deck Snapshot is an independent project and is not affiliated with or endorsed by Valve, Steam, Decky Loader, CSS Loader, Google, or rclone.
+Third-party components retain their own licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## AI-assisted development
+
+Deck Snapshot was substantially designed and implemented with OpenAI Codex under human product ownership, an approach sometimes called vibe coding.
+
+Releases are still subject to automated testing, focused security review, checksum verification, and validation on real Steam Deck hardware.
+
+AI assistance and testing do not guarantee error-free software.
+
+Deck Snapshot is an independent project and is not affiliated with or endorsed by Valve, Steam, Decky Loader, CSS Loader, Google, SteamGridDB, or rclone.
