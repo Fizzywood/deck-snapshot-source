@@ -678,8 +678,8 @@ Usage:
   deck-snapshot restore inspect [--json] [--details] <plan>
   deck-snapshot restore run --approve <plan-id> --approval-hash <hash> <plan>
   deck-snapshot cloud recovery create --output <path>
-  deck-snapshot cloud connect --recovery-file <path>
-  deck-snapshot cloud unlock --recovery-file <path>
+  deck-snapshot cloud connect [--recovery-file <path>] [--initialize]
+  deck-snapshot cloud unlock [--recovery-file <path>]
   deck-snapshot cloud status|list [cloud options] [--legacy]
   deck-snapshot cloud disconnect [--legacy-password-stdin] [cloud options]
   deck-snapshot cloud upload [cloud options] <snapshot>

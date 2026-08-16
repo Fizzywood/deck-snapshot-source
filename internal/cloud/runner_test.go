@@ -61,6 +61,15 @@ func TestCommandRunnerRedactsBoundsAndTimesOut(t *testing.T) {
 		t.Setenv("DESKTOP_SESSION", "plasma")
 		t.Setenv("KDE_FULL_SESSION", "true")
 		t.Setenv("KDE_SESSION_VERSION", "6")
+		t.Setenv("XDG_SESSION_TYPE", "wayland")
+		t.Setenv("XDG_SESSION_CLASS", "user")
+		t.Setenv("XDG_SESSION_DESKTOP", "KDE")
+		t.Setenv("XDG_SESSION_ID", "5")
+		t.Setenv("XDG_SEAT", "seat0")
+		t.Setenv("XDG_SEAT_PATH", "/org/freedesktop/DisplayManager/Seat0")
+		t.Setenv("XDG_SESSION_PATH", "/org/freedesktop/DisplayManager/Session1")
+		t.Setenv("XDG_VTNR", "1")
+		t.Setenv("XDG_MENU_PREFIX", "plasma-")
 		t.Setenv("XDG_DATA_HOME", "/home/deck/.local/share")
 		t.Setenv("XDG_DATA_DIRS", "/var/lib/flatpak/exports/share:/usr/local/share:/usr/share")
 		t.Setenv("XDG_CONFIG_HOME", "/home/deck/.config")
@@ -217,6 +226,9 @@ func TestCommandRunnerHelperProcess(t *testing.T) {
 			"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "XAUTHORITY": "/run/user/1000/xauthority",
 			"XDG_CURRENT_DESKTOP": "KDE", "DESKTOP_SESSION": "plasma", "KDE_FULL_SESSION": "true",
 			"KDE_SESSION_VERSION": "6", "XDG_DATA_HOME": "/home/deck/.local/share",
+			"XDG_SESSION_TYPE": "wayland", "XDG_SESSION_CLASS": "user", "XDG_SESSION_DESKTOP": "KDE",
+			"XDG_SESSION_ID": "5", "XDG_SEAT": "seat0", "XDG_SEAT_PATH": "/org/freedesktop/DisplayManager/Seat0",
+			"XDG_SESSION_PATH": "/org/freedesktop/DisplayManager/Session1", "XDG_VTNR": "1", "XDG_MENU_PREFIX": "plasma-",
 			"XDG_DATA_DIRS":   "/var/lib/flatpak/exports/share:/usr/local/share:/usr/share",
 			"XDG_CONFIG_HOME": "/home/deck/.config", "XDG_CONFIG_DIRS": "/home/deck/.config/kdedefaults:/etc/xdg",
 			"PATH": trustedPath,

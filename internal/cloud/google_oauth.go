@@ -24,10 +24,16 @@ import (
 const (
 	googleAuthorizationEndpoint = "https://accounts.google.com/o/oauth2/v2/auth"
 	googleTokenEndpoint         = "https://oauth2.googleapis.com/token"
+	googleDriveAPIEndpoint      = "https://www.googleapis.com/drive/v3/files"
+	googleDriveUploadEndpoint   = "https://www.googleapis.com/upload/drive/v3/files"
 	googleDriveFileScope        = "https://www.googleapis.com/auth/drive.file"
+	googleDriveAppDataScope     = "https://www.googleapis.com/auth/drive.appdata"
+	googleDriveRequestTimeout   = 30 * time.Second
 	googleOAuthMaximumBody      = 1024 * 1024
 	googleOAuthTimeout          = 30 * time.Minute
 )
+
+var googleDriveOAuthScopes = []string{googleDriveFileScope, googleDriveAppDataScope}
 
 var oauthErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
@@ -35,6 +41,8 @@ type googleOAuthDependencies struct {
 	authorizationEndpoint string
 	tokenEndpoint         string
 	client                *http.Client
+	driveAPIEndpoint      string
+	driveUploadEndpoint   string
 	openURL               func(string) error
 	now                   func() time.Time
 	timeout               time.Duration
@@ -61,25 +69,32 @@ type rcloneOAuthToken struct {
 	Expiry       time.Time `json:"expiry"`
 }
 
-func (manager Manager) obtainGoogleToken(ctx context.Context, clientID, clientCredential string) ([]byte, error) {
+type googleTokenCredentials struct {
+	AccessToken  string
+	RefreshToken string
+	TokenType    string
+	Expiry       time.Time
+}
+
+func (manager Manager) obtainGoogleToken(ctx context.Context, clientID, clientCredential string) (googleTokenCredentials, error) {
 	dependencies, err := manager.googleOAuthDependencies()
 	if err != nil {
-		return nil, err
+		return googleTokenCredentials{}, err
 	}
 	verifier, err := randomOAuthValue(64)
 	if err != nil {
-		return nil, errors.New("generate Google PKCE verifier")
+		return googleTokenCredentials{}, errors.New("generate Google PKCE verifier")
 	}
 	state, err := randomOAuthValue(32)
 	if err != nil {
-		return nil, errors.New("generate Google OAuth state")
+		return googleTokenCredentials{}, errors.New("generate Google OAuth state")
 	}
 	challengeBytes := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(challengeBytes[:])
 
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		return nil, errors.New("start private Google OAuth callback listener")
+		return googleTokenCredentials{}, errors.New("start private Google OAuth callback listener")
 	}
 	defer listener.Close()
 	redirectURL := "http://" + listener.Addr().String() + "/"
@@ -132,21 +147,21 @@ func (manager Manager) obtainGoogleToken(ctx context.Context, clientID, clientCr
 
 	authorizationURL, err := buildGoogleAuthorizationURL(dependencies.authorizationEndpoint, clientID, redirectURL, state, challenge)
 	if err != nil {
-		return nil, err
+		return googleTokenCredentials{}, err
 	}
 	if err := dependencies.openURL(authorizationURL); err != nil {
-		return nil, fmt.Errorf("open system browser for Google authorization: %w", err)
+		return googleTokenCredentials{}, fmt.Errorf("open system browser for Google authorization: %w", err)
 	}
 	waitContext, cancel := context.WithTimeout(ctx, dependencies.timeout)
 	defer cancel()
 	var callback oauthCallback
 	select {
 	case <-waitContext.Done():
-		return nil, errors.New("Google authorization did not complete before its deadline")
+		return googleTokenCredentials{}, errors.New("Google authorization did not complete before its deadline")
 	case callback = <-result:
 	}
 	if callback.err != nil {
-		return nil, callback.err
+		return googleTokenCredentials{}, callback.err
 	}
 	return exchangeGoogleAuthorizationCode(waitContext, dependencies, clientID, clientCredential, redirectURL, verifier, callback.code)
 }
@@ -158,6 +173,12 @@ func (manager Manager) googleOAuthDependencies() (googleOAuthDependencies, error
 	}
 	if dependencies.tokenEndpoint == "" {
 		dependencies.tokenEndpoint = googleTokenEndpoint
+	}
+	if dependencies.driveAPIEndpoint == "" {
+		dependencies.driveAPIEndpoint = googleDriveAPIEndpoint
+	}
+	if dependencies.driveUploadEndpoint == "" {
+		dependencies.driveUploadEndpoint = googleDriveUploadEndpoint
 	}
 	if dependencies.openURL == nil {
 		dependencies.openURL = browseropen.OpenAuthorizationURL
@@ -173,11 +194,20 @@ func (manager Manager) googleOAuthDependencies() (googleOAuthDependencies, error
 	}
 	if dependencies.client == nil {
 		dependencies.client = &http.Client{
-			Timeout:       30 * time.Second,
+			Timeout:       googleDriveRequestTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
+	} else {
+		// Never inherit a caller's redirect policy or an unbounded client when
+		// this boundary is used for the native Drive API.
+		client := *dependencies.client
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		if client.Timeout <= 0 || client.Timeout > googleDriveRequestTimeout {
+			client.Timeout = googleDriveRequestTimeout
+		}
+		dependencies.client = &client
 	}
-	if !manager.AllowUnencryptedTest && (dependencies.authorizationEndpoint != googleAuthorizationEndpoint || dependencies.tokenEndpoint != googleTokenEndpoint) {
+	if !manager.AllowUnencryptedTest && (dependencies.authorizationEndpoint != googleAuthorizationEndpoint || dependencies.tokenEndpoint != googleTokenEndpoint || dependencies.driveAPIEndpoint != googleDriveAPIEndpoint || dependencies.driveUploadEndpoint != googleDriveUploadEndpoint) {
 		return googleOAuthDependencies{}, errors.New("Google OAuth endpoints are not the required production endpoints")
 	}
 	return dependencies, nil
@@ -192,7 +222,7 @@ func buildGoogleAuthorizationURL(endpoint, clientID, redirectURL, state, challen
 	query.Set("client_id", clientID)
 	query.Set("redirect_uri", redirectURL)
 	query.Set("response_type", "code")
-	query.Set("scope", googleDriveFileScope)
+	query.Set("scope", strings.Join(googleDriveOAuthScopes, " "))
 	query.Set("access_type", "offline")
 	query.Set("prompt", "consent")
 	query.Set("state", state)
@@ -202,7 +232,7 @@ func buildGoogleAuthorizationURL(endpoint, clientID, redirectURL, state, challen
 	return parsed.String(), nil
 }
 
-func exchangeGoogleAuthorizationCode(ctx context.Context, dependencies googleOAuthDependencies, clientID, clientCredential, redirectURL, verifier, code string) ([]byte, error) {
+func exchangeGoogleAuthorizationCode(ctx context.Context, dependencies googleOAuthDependencies, clientID, clientCredential, redirectURL, verifier, code string) (googleTokenCredentials, error) {
 	values := url.Values{
 		"client_id":     {clientID},
 		"client_secret": {clientCredential},
@@ -213,44 +243,73 @@ func exchangeGoogleAuthorizationCode(ctx context.Context, dependencies googleOAu
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, dependencies.tokenEndpoint, strings.NewReader(values.Encode()))
 	if err != nil {
-		return nil, errors.New("prepare Google token exchange")
+		return googleTokenCredentials{}, errors.New("prepare Google token exchange")
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
 	response, err := dependencies.client.Do(request)
 	if err != nil {
-		return nil, errors.New("Google token exchange request failed")
+		return googleTokenCredentials{}, errors.New("Google token exchange request failed")
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, googleOAuthMaximumBody+1))
 	if err != nil || len(body) > googleOAuthMaximumBody {
-		return nil, errors.New("Google token exchange response exceeded its safe bound")
+		return googleTokenCredentials{}, errors.New("Google token exchange response exceeded its safe bound")
 	}
 	var token googleTokenResponse
 	if err := json.Unmarshal(body, &token); err != nil {
-		return nil, errors.New("Google token exchange returned an invalid response")
+		return googleTokenCredentials{}, errors.New("Google token exchange returned an invalid response")
 	}
 	if response.StatusCode != http.StatusOK {
 		if oauthErrorCodePattern.MatchString(token.Error) {
-			return nil, fmt.Errorf("Google token exchange failed with error code %s", token.Error)
+			return googleTokenCredentials{}, fmt.Errorf("Google token exchange failed with error code %s", token.Error)
 		}
-		return nil, fmt.Errorf("Google token exchange failed with HTTP status %d", response.StatusCode)
+		return googleTokenCredentials{}, fmt.Errorf("Google token exchange failed with HTTP status %d", response.StatusCode)
 	}
 	if !validOAuthSecret(token.AccessToken, 16384) || !validOAuthSecret(token.RefreshToken, 16384) ||
 		!strings.EqualFold(token.TokenType, "Bearer") || token.ExpiresIn <= 0 || token.ExpiresIn > int64((24*time.Hour)/time.Second) {
-		return nil, errors.New("Google token exchange returned incomplete credentials")
+		return googleTokenCredentials{}, errors.New("Google token exchange returned incomplete credentials")
 	}
-	if strings.TrimSpace(token.Scope) != googleDriveFileScope {
-		return nil, errors.New("Google granted an unexpected OAuth scope")
+	if err := validateGoogleGrantedScopes(token.Scope); err != nil {
+		return googleTokenCredentials{}, err
 	}
 	expiresAt := dependencies.now().UTC().Add(time.Duration(token.ExpiresIn) * time.Second)
+	return googleTokenCredentials{AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, TokenType: "Bearer", Expiry: expiresAt}, nil
+}
+
+func (credentials googleTokenCredentials) rcloneJSON() ([]byte, error) {
 	encoded, err := json.Marshal(rcloneOAuthToken{
-		AccessToken: token.AccessToken, TokenType: "Bearer", RefreshToken: token.RefreshToken, Expiry: expiresAt,
+		AccessToken: credentials.AccessToken, TokenType: credentials.TokenType, RefreshToken: credentials.RefreshToken, Expiry: credentials.Expiry,
 	})
 	if err != nil {
 		return nil, errors.New("encode protected Google token")
 	}
 	return encoded, nil
+}
+
+func validateGoogleGrantedScopes(value string) error {
+	if value == "" || strings.ContainsAny(value, "\t\r\n") {
+		return errors.New("Google granted a malformed OAuth scope set")
+	}
+	values := strings.Fields(value)
+	if len(values) != len(googleDriveOAuthScopes) {
+		return errors.New("Google granted an unexpected OAuth scope set")
+	}
+	wanted := make(map[string]struct{}, len(googleDriveOAuthScopes))
+	for _, scope := range googleDriveOAuthScopes {
+		wanted[scope] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, scope := range values {
+		if _, ok := wanted[scope]; !ok {
+			return errors.New("Google granted an unexpected OAuth scope set")
+		}
+		if _, ok := seen[scope]; ok {
+			return errors.New("Google granted a malformed OAuth scope set")
+		}
+		seen[scope] = struct{}{}
+	}
+	return nil
 }
 
 func randomOAuthValue(size int) (string, error) {

@@ -67,3 +67,28 @@ func TestRecoveryRejectsTrailingData(t *testing.T) {
 		t.Fatalf("LoadRecovery() accepted trailing data: %v", err)
 	}
 }
+
+func TestManagedRecoveryIsIdempotentButNeverReplaced(t *testing.T) {
+	material, err := GenerateRecovery(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := GenerateRecovery(time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	if err := SaveManagedRecovery(path, material); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveManagedRecovery(path, material); err != nil {
+		t.Fatalf("identical managed recovery was not accepted: %v", err)
+	}
+	if err := SaveManagedRecovery(path, other); err == nil || !strings.Contains(err.Error(), "different material") {
+		t.Fatalf("conflicting managed recovery was accepted: %v", err)
+	}
+	loaded, err := LoadRecovery(path)
+	if err != nil || loaded != material {
+		t.Fatalf("managed recovery changed after conflict: %#v, %v", loaded, err)
+	}
+}

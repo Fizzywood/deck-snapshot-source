@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	cloudcore "github.com/Fizzywood/deck-snapshot/internal/cloud"
 	"github.com/Fizzywood/deck-snapshot/internal/manifest"
 	"github.com/Fizzywood/deck-snapshot/internal/platform"
 	"github.com/Fizzywood/deck-snapshot/internal/pluginstore"
@@ -112,11 +113,26 @@ func TestCloudLegacyModeIsReadOnly(t *testing.T) {
 }
 
 func TestCloudRecoveryCreateIsEnglishAndNoReplace(t *testing.T) {
+	home := t.TempDir()
+	paths, err := platform.Resolve(fakeEnvironment{home: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.CloudConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	material, err := cloudcore.GenerateRecovery(time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cloudcore.SaveRecovery(filepath.Join(filepath.Dir(paths.CloudConfig), cloudcore.ManagedRecoveryFileName), material); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(t.TempDir(), "recovery.json")
-	dependencies := Dependencies{Now: func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) }}
+	dependencies := Dependencies{Environment: fakeEnvironment{home: home}, Now: func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) }}
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"cloud", "recovery", "create", "--output", path}, &stdout, &stderr, dependencies)
-	if code != ExitOK || !strings.Contains(stdout.String(), "Recovery material created") || stderr.Len() != 0 {
+	if code != ExitOK || !strings.Contains(stdout.String(), "Recovery key exported") || stderr.Len() != 0 {
 		t.Fatalf("cloud recovery create = code %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
@@ -124,6 +140,19 @@ func TestCloudRecoveryCreateIsEnglishAndNoReplace(t *testing.T) {
 	code = Run([]string{"cloud", "recovery", "create", "--output", path}, &stdout, &stderr, dependencies)
 	if code != ExitRuntime || !strings.Contains(stderr.String(), "not replaced") {
 		t.Fatalf("second cloud recovery create = code %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestCloudRecoveryCreateDoesNotGenerateUnrelatedKey(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"cloud", "recovery", "create", "--output", path}, &stdout, &stderr, Dependencies{Environment: fakeEnvironment{home: home}})
+	if code != ExitRuntime || !strings.Contains(stderr.String(), "No managed recovery key") {
+		t.Fatalf("unconfigured recovery export = code %d, stderr %q", code, stderr.String())
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("unconfigured recovery export created a key: %v", err)
 	}
 }
 

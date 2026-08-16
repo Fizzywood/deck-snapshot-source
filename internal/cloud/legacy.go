@@ -13,7 +13,8 @@ const LegacyConnectionDirectoryName = "legacy-v0.1.0"
 
 // PreserveLegacyConnection retains the encrypted v0.1.0 OAuth configuration
 // and its verified local unlock key without replacing a different preserved
-// connection. Recovery material remains in its separately selected file.
+// connection. Recovery material remains in the explicitly selected fallback
+// file because the retired provider identity cannot use the managed object.
 func PreserveLegacyConnection(configPath, passwordPath, destinationDirectory string) error {
 	configContents, err := readPrivateRegular(configPath, 1024*1024)
 	if err != nil {

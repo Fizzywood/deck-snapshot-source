@@ -92,6 +92,55 @@ func TestGooglePKCERejectsUnexpectedGrantedScope(t *testing.T) {
 	}
 }
 
+func TestGooglePKCEAcceptsScopeSetInEitherOrder(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(response, `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","scope":"https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/drive.file","expires_in":3600}`)
+	}))
+	defer tokenServer.Close()
+	manager := Manager{AllowUnencryptedTest: true}
+	manager.googleOAuth = googleOAuthDependencies{
+		authorizationEndpoint: googleAuthorizationEndpoint,
+		tokenEndpoint:         tokenServer.URL,
+		client:                tokenServer.Client(),
+		timeout:               time.Second,
+		now:                   time.Now,
+		openURL:               successfulSyntheticCallback,
+	}
+	if _, err := manager.obtainGoogleToken(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential); err != nil {
+		t.Fatalf("scope set was rejected: %v", err)
+	}
+}
+
+func TestGooglePKCERejectsPartialOrDuplicateScopeSet(t *testing.T) {
+	for name, scope := range map[string]string{
+		"partial":   googleDriveFileScope,
+		"duplicate": googleDriveFileScope + " " + googleDriveFileScope,
+		"extra":     googleDriveFileScope + " https://www.googleapis.com/auth/drive",
+		"newline":   googleDriveFileScope + "\n" + googleDriveAppDataScope,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tokenServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(response, `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","scope":"`+scope+`","expires_in":3600}`)
+			}))
+			defer tokenServer.Close()
+			manager := Manager{AllowUnencryptedTest: true}
+			manager.googleOAuth = googleOAuthDependencies{
+				authorizationEndpoint: googleAuthorizationEndpoint,
+				tokenEndpoint:         tokenServer.URL,
+				client:                tokenServer.Client(),
+				timeout:               time.Second,
+				now:                   time.Now,
+				openURL:               successfulSyntheticCallback,
+			}
+			if _, err := manager.obtainGoogleToken(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential); err == nil {
+				t.Fatal("malformed scope set was accepted")
+			}
+		})
+	}
+}
+
 func successfulSyntheticCallback(value string) error {
 	parsed, err := url.Parse(value)
 	if err != nil {

@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -17,13 +18,15 @@ import (
 )
 
 const (
-	recoverySchema      = 1
-	maximumRecoverySize = 16 * 1024
+	recoverySchema          = 1
+	maximumRecoverySize     = 16 * 1024
+	ManagedRecoveryFileName = "recovery.json"
 )
 
-// RecoveryMaterial is the separately stored key material required to decrypt
-// protected cloud snapshots after a fresh installation. It never contains an
-// OAuth token or the rclone configuration password.
+// RecoveryMaterial is the schema-1 key material used to decrypt protected
+// cloud snapshots after a fresh installation. It is stored in the fixed
+// appData recovery object and may also be exported as an Advanced fallback.
+// It never contains an OAuth token or the rclone configuration password.
 type RecoveryMaterial struct {
 	Schema         int    `json:"schema"`
 	CreatedUTC     string `json:"created_utc"`
@@ -68,11 +71,10 @@ func SaveRecovery(path string, material RecoveryMaterial) error {
 	if err != nil || !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 {
 		return errors.New("recovery export directory is missing or unsafe")
 	}
-	encoded, err := json.MarshalIndent(material, "", "  ")
+	encoded, err := encodeRecovery(material)
 	if err != nil {
 		return err
 	}
-	encoded = append(encoded, '\n')
 	file, err := os.OpenFile(absolute, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -100,6 +102,36 @@ func SaveRecovery(path string, material RecoveryMaterial) error {
 	return syncDirectory(directory)
 }
 
+// SaveManagedRecovery stores the application-owned local recovery copy. An
+// existing identical copy is accepted; different material is never replaced.
+func SaveManagedRecovery(path string, material RecoveryMaterial) error {
+	if err := validateRecovery(material); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		existing, loadErr := LoadRecovery(path)
+		if loadErr != nil {
+			return fmt.Errorf("managed recovery material is not usable: %w", loadErr)
+		}
+		if existing == material {
+			return nil
+		}
+		return errors.New("managed recovery material already exists with different material")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := SaveRecovery(path, material); err != nil {
+		// A concurrent first writer may have created the same immutable copy
+		// between the no-replace check and the create. Accept it only after a
+		// full strict read-back proves the exact same material was stored.
+		if existing, loadErr := LoadRecovery(path); loadErr == nil && existing == material {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 func LoadRecovery(path string) (RecoveryMaterial, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil || filepath.Clean(path) != absolute || validateExistingDirectory(filepath.Dir(absolute)) != nil {
@@ -117,7 +149,20 @@ func LoadRecovery(path string) (RecoveryMaterial, error) {
 		return RecoveryMaterial{}, err
 	}
 	defer file.Close()
-	decoder := json.NewDecoder(io.LimitReader(file, maximumRecoverySize+1))
+	contents, err := io.ReadAll(io.LimitReader(file, maximumRecoverySize+1))
+	if err != nil || len(contents) > maximumRecoverySize {
+		return RecoveryMaterial{}, errors.New("recovery material size is invalid")
+	}
+	return ParseRecovery(contents)
+}
+
+// ParseRecovery validates a bounded recovery JSON payload from a trusted
+// file or the native Google Drive appData API.
+func ParseRecovery(contents []byte) (RecoveryMaterial, error) {
+	if len(contents) == 0 || len(contents) > maximumRecoverySize {
+		return RecoveryMaterial{}, errors.New("recovery material size is invalid")
+	}
+	decoder := json.NewDecoder(io.LimitReader(bytes.NewReader(contents), maximumRecoverySize+1))
 	decoder.DisallowUnknownFields()
 	var material RecoveryMaterial
 	if err := decoder.Decode(&material); err != nil {
@@ -131,6 +176,17 @@ func LoadRecovery(path string) (RecoveryMaterial, error) {
 		return RecoveryMaterial{}, err
 	}
 	return material, nil
+}
+
+func encodeRecovery(material RecoveryMaterial) ([]byte, error) {
+	if err := validateRecovery(material); err != nil {
+		return nil, err
+	}
+	encoded, err := json.MarshalIndent(material, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(encoded, '\n'), nil
 }
 
 func ProtectRecovery(ctx context.Context, runner Runner, material RecoveryMaterial) (ProtectedRecovery, error) {

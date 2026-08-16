@@ -26,13 +26,15 @@ const (
 type dependencies struct {
 	lookupEnv    func(string) (string, bool)
 	stat         func(string) (os.FileInfo, error)
+	launchPortal func(string, []string) error
 	queryDefault func([]string) (string, error)
 	launch       func(string, string, []string) error
 }
 
-// Run validates one OAuth authorization URL, resolves the user's registered
-// HTTPS handler, and opens it without exposing cloud-secret environment fields.
-// It deliberately emits no output because the URL contains transient OAuth data.
+// Run validates one OAuth authorization URL and opens it through the active
+// desktop portal, falling back to the user's registered HTTPS handler without
+// exposing cloud-secret environment fields. It deliberately emits no output
+// because the URL contains transient OAuth data.
 func Run(args []string) int {
 	return run(args, systemDependencies())
 }
@@ -55,6 +57,26 @@ func systemDependencies() dependencies {
 	deps := dependencies{
 		lookupEnv: os.LookupEnv,
 		stat:      os.Stat,
+	}
+	deps.launchPortal = func(targetURL string, environment []string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		defer cancel()
+		command := exec.CommandContext(ctx, "/usr/bin/gdbus", "call", "--session",
+			"--dest", "org.freedesktop.portal.Desktop",
+			"--object-path", "/org/freedesktop/portal/desktop",
+			"--method", "org.freedesktop.portal.OpenURI.OpenURI", "", targetURL, "{}")
+		command.Env = environment
+		output := &boundedBuffer{maximum: queryLimit}
+		command.Stdout = output
+		command.Stderr = &boundedBuffer{maximum: queryLimit}
+		if err := command.Run(); err != nil || ctx.Err() != nil || output.overflow {
+			return errors.New("desktop portal did not accept the browser request")
+		}
+		value := strings.TrimSpace(output.String())
+		if !strings.HasPrefix(value, "(objectpath '/org/freedesktop/portal/desktop/request/") || !strings.HasSuffix(value, "',)") {
+			return errors.New("desktop portal returned an invalid request")
+		}
+		return nil
 	}
 	deps.queryDefault = func(environment []string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
@@ -85,6 +107,12 @@ func run(args []string, deps dependencies) int {
 		return usageExitCode
 	}
 	environment := safeEnvironment(deps.lookupEnv)
+	if !hasGraphicalSession(environment) {
+		return failureExitCode
+	}
+	if deps.launchPortal != nil && deps.launchPortal(args[0], environment) == nil {
+		return 0
+	}
 	desktop, err := deps.queryDefault(environment)
 	if err != nil || !validDesktopID(desktop) {
 		return failureExitCode
@@ -97,6 +125,21 @@ func run(args []string, deps dependencies) int {
 		return failureExitCode
 	}
 	return 0
+}
+
+// hasGraphicalSession prevents a successful desktop-handler dispatch from
+// being mistaken for a visible browser launch when Deck Snapshot was started
+// outside the user's Desktop Mode session (for example, through SSH).
+func hasGraphicalSession(environment []string) bool {
+	for _, entry := range environment {
+		if entry == "DISPLAY=" || entry == "WAYLAND_DISPLAY=" {
+			continue
+		}
+		if strings.HasPrefix(entry, "DISPLAY=") || strings.HasPrefix(entry, "WAYLAND_DISPLAY=") {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedAuthorizationURL(value string) bool {
@@ -156,7 +199,15 @@ func resolveDesktopFile(desktop string, lookupEnv func(string) (string, bool), s
 	if !exists || dataDirectories == "" {
 		dataDirectories = strings.Join([]string{"/usr/local/share", "/usr/share"}, string(os.PathListSeparator))
 	}
-	search := append([]string{dataHome}, filepath.SplitList(dataDirectories)...)
+	// Flatpak exports are a standard part of the desktop application search
+	// path on SteamOS. Prefer them ahead of system AppStream wrappers with the
+	// same desktop ID so GIO launches the user's actual browser application.
+	search := []string{
+		dataHome,
+		filepath.Join(dataHome, "flatpak", "exports", "share"),
+		"/var/lib/flatpak/exports/share",
+	}
+	search = append(search, filepath.SplitList(dataDirectories)...)
 	for _, directory := range search {
 		if !filepath.IsAbs(directory) || strings.ContainsAny(directory, "\x00\r\n") {
 			continue
@@ -175,6 +226,8 @@ func safeEnvironment(lookupEnv func(string) (string, bool)) []string {
 		"HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "SSL_CERT_FILE", "SSL_CERT_DIR",
 		"DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY",
 		"XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "KDE_FULL_SESSION", "KDE_SESSION_VERSION",
+		"XDG_SESSION_TYPE", "XDG_SESSION_CLASS", "XDG_SESSION_DESKTOP", "XDG_SESSION_ID",
+		"XDG_SEAT", "XDG_SEAT_PATH", "XDG_SESSION_PATH", "XDG_VTNR", "XDG_MENU_PREFIX",
 		"XDG_DATA_HOME", "XDG_DATA_DIRS", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS",
 	}
 	values := map[string]string{

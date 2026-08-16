@@ -24,7 +24,17 @@ var googleDesktopClientPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{8,240}\.app
 // Desktop credential is a non-confidential installed-app credential, but Deck
 // Snapshot still keeps it out of URLs, process arguments, logs and plaintext
 // files.
-func (manager Manager) ConnectGoogle(ctx context.Context, clientID, clientCredential string, now time.Time) (status Status, err error) {
+func (manager Manager) ConnectGoogle(ctx context.Context, clientID, clientCredential string, now time.Time) (Status, error) {
+	return manager.connectGoogle(ctx, clientID, clientCredential, now, false)
+}
+
+// ConnectGoogleWithInitialization is used only after the UI has explicitly
+// confirmed that this Google account has no existing Deck Snapshot backups.
+func (manager Manager) ConnectGoogleWithInitialization(ctx context.Context, clientID, clientCredential string, now time.Time) (Status, error) {
+	return manager.connectGoogle(ctx, clientID, clientCredential, now, true)
+}
+
+func (manager Manager) connectGoogle(ctx context.Context, clientID, clientCredential string, now time.Time, initialize bool) (status Status, err error) {
 	if manager.ExpectedBaseType != "drive" {
 		return Status{}, errors.New("Google connection requires the Drive backend")
 	}
@@ -65,11 +75,72 @@ func (manager Manager) ConnectGoogle(ctx context.Context, clientID, clientCreden
 	if err != nil {
 		return Status{}, fmt.Errorf("complete Google Drive PKCE authorization: %w", err)
 	}
-	defer clear(token)
+	defer func() {
+		token.AccessToken = ""
+		token.RefreshToken = ""
+	}()
+	lookup, err := manager.lookupRecoveryObject(ctx, token.AccessToken)
+	if err != nil {
+		return Status{}, err
+	}
+	existingSnapshots, err := manager.hasVisibleSnapshotObjects(ctx, token.AccessToken)
+	if err != nil {
+		return Status{}, err
+	}
+	var material RecoveryMaterial
+	allowAppDataCreate := false
+	switch lookup.State {
+	case appDataValid:
+		material = lookup.Material
+		if manager.ManualRecovery && manager.RecoveryMaterial != nil && *manager.RecoveryMaterial != material {
+			return Status{}, errors.New("the imported recovery file conflicts with Google Drive recovery data")
+		}
+	case appDataConflict:
+		return Status{}, errors.New("Google Drive contains conflicting recovery objects; no key was selected")
+	case appDataInvalid:
+		if !manager.ManualRecovery || manager.RecoveryMaterial == nil {
+			return Status{}, errors.New("Google Drive recovery data is invalid; import the original recovery file from Advanced options")
+		}
+		material = *manager.RecoveryMaterial
+	case appDataMissing:
+		if manager.ManualRecovery && manager.RecoveryMaterial != nil {
+			material = *manager.RecoveryMaterial
+			if existingSnapshots || initialize {
+				allowAppDataCreate = true
+			} else {
+				return Status{}, errors.New("no matching Deck Snapshot recovery data or encrypted backups were found in this Google account; confirm setup with --initialize")
+			}
+		} else if existingSnapshots {
+			return Status{}, errors.New("existing encrypted Google Drive backups need their original recovery key; import it from Advanced options")
+		} else if !initialize {
+			return Status{}, errors.New("no matching Deck Snapshot recovery data or encrypted backups were found in this Google account; confirm setup with --initialize")
+		} else {
+			material, err = GenerateRecovery(now)
+			if err != nil {
+				return Status{}, errors.New("generate new cloud recovery material")
+			}
+			allowAppDataCreate = true
+		}
+	default:
+		return Status{}, errors.New("Google Drive recovery state is invalid")
+	}
+	protected, err := ProtectRecovery(ctx, manager.Runner, material)
+	if err != nil {
+		return Status{}, fmt.Errorf("prepare cloud recovery material: %w", err)
+	}
+	manager.RecoveryMaterial = &material
+	manager.ProtectionFingerprint = protected.MaterialFingerprint
+	manager.CryptPassword = protected.Password
+	manager.CryptPassword2 = protected.Password2
+	tokenJSON, err := token.rcloneJSON()
+	if err != nil {
+		return Status{}, err
+	}
+	defer clear(tokenJSON)
 	secureInput, err := json.Marshal(secureConfigInput{
 		Name: manager.BaseRemote, Type: "drive",
 		Parameters: map[string]string{
-			"client_id": clientID, "client_secret": clientCredential, "scope": "drive.file", "config_is_local": "true", "token": string(token),
+			"client_id": clientID, "client_secret": clientCredential, "scope": "drive.file", "config_is_local": "true", "token": string(tokenJSON),
 		},
 	})
 	if err != nil {
@@ -105,16 +176,46 @@ func (manager Manager) ConnectGoogle(ctx context.Context, clientID, clientCreden
 	if _, err = manager.run(ctx, "mkdir", manager.remoteRoot()); err != nil {
 		return Status{}, fmt.Errorf("create the protected Google Drive snapshot folder: %w", err)
 	}
-	if _, err = manager.listRemote(ctx); err != nil {
+	items, err := manager.listRemote(ctx)
+	if err != nil {
 		return Status{}, fmt.Errorf("verify protected Google Drive reachability: %w", err)
+	}
+	// The native visible-folder probe is intentionally conservative and can
+	// miss files created by an older authorization identity. Treat the actual
+	// encrypted rclone listing as authoritative and verify one reachable
+	// ciphertext with every recovered key, including an appData key. This
+	// prevents a schema-valid but mismatched key from being accepted.
+	if existingSnapshots || len(items) > 0 {
+		if len(items) == 0 {
+			return Status{}, errors.New("the imported recovery key did not reveal any protected Google Drive snapshots")
+		}
+		if err := manager.verifyRemoteSnapshot(ctx, items[0].Name); err != nil {
+			return Status{}, fmt.Errorf("verify the imported recovery key against an existing cloud snapshot: %w", err)
+		}
+	}
+	if lookup.State == appDataMissing && allowAppDataCreate {
+		lookup, err = manager.createRecoveryObject(ctx, token.AccessToken, material)
+		if err != nil {
+			return Status{}, err
+		}
+	}
+	if manager.RecoveryPath != "" {
+		if err := SaveManagedRecovery(manager.RecoveryPath, material); err != nil {
+			return Status{}, fmt.Errorf("save managed local recovery material: %w", err)
+		}
 	}
 	if err = manager.AcknowledgeRecovery(now); err != nil {
 		return Status{}, fmt.Errorf("record recovery acknowledgement: %w", err)
 	}
-	return Status{
+	status = Status{
 		Configured: true, Protected: true, RecoveryAcknowledged: true, Remote: manager.CryptRemote,
-		Scope: profile.scope, Folder: profile.folder, Legacy: profile.legacy,
-	}, nil
+		Scope: profile.scope, OAuthScopes: strings.Join(googleDriveOAuthScopes, " "), Folder: profile.folder, Legacy: profile.legacy,
+		ConfigurationMessage: lookup.Warning,
+	}
+	if lookup.State == appDataInvalid {
+		status.ConfigurationMessage = "Google Drive recovery data is invalid; the verified manual recovery file remains required"
+	}
+	return status, nil
 }
 
 // Disconnect forgets only Deck Snapshot's local configuration and recovery
@@ -149,7 +250,7 @@ func (manager Manager) Disconnect(ctx context.Context) error {
 }
 
 func (manager Manager) validateConnectionInputs(clientID, clientCredential string) error {
-	if err := manager.validate(); err != nil {
+	if err := manager.validateBase(); err != nil {
 		return err
 	}
 	if !googleDesktopClientPattern.MatchString(clientID) {

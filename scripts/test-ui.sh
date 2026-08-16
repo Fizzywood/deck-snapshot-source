@@ -24,7 +24,7 @@ if [[ "$*" == "doctor" ]]; then
   printf 'Deck Snapshot diagnostics: ready\nSteam detected: true\nDecky detected: true\nCloud configured: false\nSteam accounts: 1\nPlugins: 1\nCSS themes/profiles: 1\nCustom artwork: 1\nCandidate files: 4\nDiscovery warnings: 0\nChecked at: 2026-08-15T12:24:00Z\n'
   exit 0
 fi
-if [[ "$*" == "settings show" && "${UI_SCENARIO:-}" =~ ^(dashboard|backup_cloud_retry|backup_cloud_fail)$ ]]; then
+if [[ "$*" == "settings show" && "${UI_SCENARIO:-}" =~ ^(dashboard|backup_cloud_retry|backup_cloud_fail|cloud)$ ]]; then
   printf 'Automatic cloud upload: true\nCloud recovery file: %s\n' "$TEST_RECOVERY_FILE"
   exit 0
 fi
@@ -54,11 +54,15 @@ if [[ "$*" == "cloud list --recovery-file $TEST_RECOVERY_FILE" && "${UI_SCENARIO
   printf 'deck-snapshot-20260815T010203Z-dsnap-dashboard.tar.gz  42 bytes  2026-08-15T01:02:03Z\n'
   exit 0
 fi
-if [[ "${UI_SCENARIO:-}" == "restore" && "$*" == "restore plan $SNAPSHOT_FILE" ]]; then
+if [[ "$*" == "snapshot inspect $SNAPSHOT_FILE" ]]; then
+  printf 'Snapshot: dsnap-dashboard\nCreated: 2026-08-15T01:02:03Z\nApplication version: v0.1.4-dev\nFiles: 4 (42 bytes)\nPlugins: 1\nCSS themes/profiles: 2\nArtwork: 3\nWarnings: 0\n'
+  exit 0
+fi
+if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore)$ && "$*" == "restore plan $SNAPSHOT_FILE" ]]; then
   printf 'Restore plan created without target writes: %s\nPlan ID: restore-aaaaaaaaaaaaaaaa\nApproval hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nActions: 1\nPlugins: 0\nBlocking: false\nRequired free space: 1 bytes\n' "$TEST_PLAN_FILE"
   exit 0
 fi
-if [[ "${UI_SCENARIO:-}" == "restore" && "$*" == "restore inspect --details $TEST_PLAN_FILE" ]]; then
+if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore)$ && "$*" == "restore inspect --details $TEST_PLAN_FILE" ]]; then
   printf 'Plan ID: restore-aaaaaaaaaaaaaaaa\nFile action: unchanged | steam | fixture -> synthetic-target\n'
   exit 0
 fi
@@ -84,7 +88,8 @@ if [[ " $* " == *' --menu '* ]]; then
   if [[ "$UI_SCENARIO" == local ]]; then
     case "$count" in
       1) printf 'create\n' ;;
-      2) printf 'doctor\n' ;;
+      2) printf 'more\n' ;;
+      3) printf 'doctor\n' ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == cloud ]]; then
@@ -112,6 +117,23 @@ if [[ " $* " == *' --menu '* ]]; then
     case "$count" in
       1) printf 'snapshots\n' ;;
       2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      3) printf 'close\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == snapshot_restore ]]; then
+    case "$count" in
+      1) printf 'snapshots\n' ;;
+      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      3) printf 'restore\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == decky_missing ]]; then
+    case "$count" in
+      1) printf 'restore\n' ;;
+      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      3) printf 'get_decky\n' ;;
+      4) printf 'check_again\n' ;;
+      5) printf 'close\n' ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == settings ]]; then
@@ -184,6 +206,13 @@ exit 0
 SCRIPT
 chmod 0755 -- "$TEST_ROOT/flock"
 
+cat >"$TEST_ROOT/xdg-open" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$BROWSER_LOG"
+SCRIPT
+chmod 0755 -- "$TEST_ROOT/xdg-open"
+
 export TEST_LOG="$TEST_ROOT/core.log"
 export MENU_COUNT="$TEST_ROOT/menu.count"
 export FILE_COUNT="$TEST_ROOT/file.count"
@@ -191,6 +220,7 @@ export PASSWORD_COUNT="$TEST_ROOT/password.count"
 export UPLOAD_COUNT="$TEST_ROOT/upload.count"
 export KDIALOG_LOG="$TEST_ROOT/kdialog.log"
 export QDBUS_LOG="$TEST_ROOT/qdbus.log"
+export BROWSER_LOG="$TEST_ROOT/browser.log"
 export SNAPSHOT_FILE="$TEST_ROOT/snapshot.tar.gz"
 export TEST_RECOVERY_FILE="$TEST_ROOT/recovery.json"
 export TEST_PLAN_FILE="$TEST_ROOT/restore-plan.json"
@@ -208,6 +238,7 @@ grep -F 'Backup complete' "$KDIALOG_LOG" >/dev/null
 grep -F 'Steam               ✓ Ready' "$KDIALOG_LOG" >/dev/null
 grep -F -- '--progressbar Creating and validating the local backup… 0' "$KDIALOG_LOG" >/dev/null
 grep -F 'org.kde.kdialog-4242 /ProgressDialog close' "$QDBUS_LOG" >/dev/null
+grep -F 'Diagnostics' "$KDIALOG_LOG" >/dev/null
 
 : >"$TEST_LOG"
 : >"$KDIALOG_LOG"
@@ -255,21 +286,46 @@ test ! -e "$PASSWORD_COUNT"
 
 : >"$TEST_LOG"
 : >"$KDIALOG_LOG"
+: >"$BROWSER_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+mkdir -p -- "$HOME/.local/share/deck-snapshot/snapshots"
+export SNAPSHOT_FILE="$HOME/.local/share/deck-snapshot/snapshots/deck-snapshot-20260815T010203Z-dsnap-dashboard.tar.gz"
+touch "$SNAPSHOT_FILE"
+export UI_SCENARIO=decky_missing
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'Decky</td><td align="right">— Not installed</td>' "$KDIALOG_LOG" >/dev/null
+grep -F 'Decky Loader — Not installed' "$KDIALOG_LOG" >/dev/null
+grep -F 'Decky Loader is required to restore Decky plugins and their settings.' "$KDIALOG_LOG" >/dev/null
+grep -Fx 'https://github.com/SteamDeckHomebrew/decky-loader' "$BROWSER_LOG" >/dev/null
+if grep -F 'restore plan ' "$TEST_LOG" >/dev/null; then
+  printf 'Decky recovery prompt unexpectedly started restore planning.\n' >&2
+  exit 1
+fi
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
 rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
 mkdir -p -- "$HOME/.config/deck-snapshot/cloud" "$HOME/.local/share/deck-snapshot/snapshots" "$HOME/homebrew/plugins/example-plugin"
 touch "$HOME/.config/deck-snapshot/cloud/rclone.conf" "$HOME/.config/deck-snapshot/cloud/config-password"
-touch "$HOME/.local/share/deck-snapshot/snapshots/deck-snapshot-20260815T010203Z-dsnap-dashboard.tar.gz"
+touch "$SNAPSHOT_FILE"
 export UI_SCENARIO=dashboard
 "$APP_DIR/deck-snapshot-ui"
 grep -F '<td align="left">Google Drive</td><td align="right">✓ Connected</td>' "$KDIALOG_LOG" >/dev/null
 grep -F '<td align="left">Decky</td><td align="right">✓ 1 plugins</td>' "$KDIALOG_LOG" >/dev/null
 grep -F '<td align="left">Stored</td><td align="right">✓ Local + Cloud</td>' "$KDIALOG_LOG" >/dev/null
-grep -F '<td align="left">Updates</td><td align="right">No automatic updates</td>' "$KDIALOG_LOG" >/dev/null
+if grep -F '<td align="left">Updates</td>' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The dashboard still exposed a permanent updates row.\n' >&2
+  exit 1
+fi
 grep -F 'v0.1.3 development build' "$KDIALOG_LOG" >/dev/null
 grep -F 'Create Backup' "$KDIALOG_LOG" >/dev/null
 grep -F ' Restore ' "$KDIALOG_LOG" >/dev/null
 grep -F ' Snapshots ' "$KDIALOG_LOG" >/dev/null
 grep -F ' More options ' "$KDIALOG_LOG" >/dev/null
+if grep -F ' doctor Diagnostics' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The primary dashboard still exposed Diagnostics.\n' >&2
+  exit 1
+fi
 if grep -F 'Unlock a v0.1.0 cloud connection' "$KDIALOG_LOG" >/dev/null; then
   printf 'The primary dashboard exposed a migration action.\n' >&2
   exit 1
@@ -286,12 +342,32 @@ grep -Fx "cloud connect --recovery-file $TEST_RECOVERY_FILE" "$TEST_LOG" >/dev/n
 
 : >"$TEST_LOG"
 rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
-export SNAPSHOT_FILE="$HOME/.local/share/deck-snapshot/snapshots/deck-snapshot-20260815T010203Z-dsnap-dashboard.tar.gz"
 export UI_SCENARIO=snapshots
 "$APP_DIR/deck-snapshot-ui"
 grep -Fx "snapshot inspect $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
 if grep -F 'restore plan ' "$TEST_LOG" >/dev/null; then
   printf 'Snapshot browsing unexpectedly started restore planning.\n' >&2
+  exit 1
+fi
+grep -F 'Backup date/time: 2026-08-15T01:02:03Z' "$KDIALOG_LOG" >/dev/null
+grep -F 'Validation: Valid' "$KDIALOG_LOG" >/dev/null
+grep -F 'Decky plugins: 1' "$KDIALOG_LOG" >/dev/null
+grep -F 'CSS Loader themes/profiles: 2' "$KDIALOG_LOG" >/dev/null
+grep -F 'Steam artwork: 3' "$KDIALOG_LOG" >/dev/null
+grep -F 'Restore this backup' "$KDIALOG_LOG" >/dev/null
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+touch "$TEST_PLAN_FILE"
+export UI_SCENARIO=snapshot_restore
+"$APP_DIR/deck-snapshot-ui"
+test "$(grep -Fc "snapshot inspect $SNAPSHOT_FILE" "$TEST_LOG")" -eq 1
+grep -Fx "restore plan $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
+grep -Fx "restore inspect --details $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
+grep -Fx "restore run --approve restore-aaaaaaaaaaaaaaaa --approval-hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
+if grep -F 'Deck Snapshot — Restore' "$KDIALOG_LOG" >/dev/null; then
+  printf 'Snapshot restore unexpectedly opened a second snapshot chooser.\n' >&2
   exit 1
 fi
 

@@ -33,6 +33,7 @@ type Manager struct {
 	SnapshotDirectory     string
 	StateDirectory        string
 	ConfigPath            string
+	RecoveryPath          string
 	ConfigPassword        string
 	CryptRemote           string
 	BaseRemote            string
@@ -41,6 +42,8 @@ type Manager struct {
 	ProtectionFingerprint string
 	CryptPassword         string
 	CryptPassword2        string
+	RecoveryMaterial      *RecoveryMaterial
+	ManualRecovery        bool
 	AllowUnencryptedTest  bool
 	Limits                limits.Limits
 	googleOAuth           googleOAuthDependencies
@@ -52,6 +55,7 @@ type Status struct {
 	RecoveryAcknowledged bool   `json:"recovery_acknowledged"`
 	Remote               string `json:"remote"`
 	Scope                string `json:"scope,omitempty"`
+	OAuthScopes          string `json:"oauth_scopes,omitempty"`
 	Folder               string `json:"folder,omitempty"`
 	Legacy               bool   `json:"legacy"`
 	ConfigurationMessage string `json:"configuration_message,omitempty"`
@@ -98,6 +102,10 @@ func (manager Manager) InspectConfiguration(ctx context.Context) (Status, error)
 	if err != nil {
 		return Status{}, err
 	}
+	// The encrypted rclone configuration intentionally does not expose the
+	// token's granted-scope claim through the redacted remote view. Do not
+	// infer the new appData permission from the visible drive.file profile;
+	// only a completed PKCE connection can report the exact two-scope set.
 	return Status{Configured: true, Protected: true, RecoveryAcknowledged: acknowledged, Remote: manager.CryptRemote, Scope: profile.scope, Folder: profile.folder, Legacy: profile.legacy}, nil
 }
 
@@ -170,7 +178,7 @@ func (manager Manager) Upload(ctx context.Context, snapshotPath string) (Item, e
 	}
 	acknowledged, err := manager.recoveryAcknowledged()
 	if err != nil || !acknowledged {
-		return Item{}, errors.New("cloud upload is disabled until matching recovery material is exported and acknowledged")
+		return Item{}, errors.New("cloud upload is disabled until matching recovery material is stored and acknowledged")
 	}
 	absolute, err := filepath.Abs(snapshotPath)
 	if err != nil {
@@ -339,6 +347,28 @@ func (manager Manager) verifyRemoteRoundtrip(ctx context.Context, sourcePath, na
 	return nil
 }
 
+func (manager Manager) verifyRemoteSnapshot(ctx context.Context, name string) error {
+	if !validSnapshotName(name) {
+		return errors.New("cloud snapshot name is unsafe")
+	}
+	if err := ensurePrivateDirectory(manager.SnapshotDirectory); err != nil {
+		return err
+	}
+	temporaryName, err := randomName(".deck-snapshot-cloud-recovery-verify-", ".tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := filepath.Join(manager.SnapshotDirectory, temporaryName)
+	defer os.Remove(temporaryPath)
+	if _, err := manager.run(ctx, "copyto", manager.remotePath(name), temporaryPath, "--immutable"); err != nil {
+		return fmt.Errorf("download protected snapshot for recovery verification: %w", err)
+	}
+	if _, err := snapshot.ValidateContext(ctx, temporaryPath, manager.Limits); err != nil {
+		return fmt.Errorf("validate protected snapshot for recovery verification: %w", err)
+	}
+	return nil
+}
+
 func (manager Manager) run(ctx context.Context, arguments ...string) (Result, error) {
 	secrets := map[string]string{}
 	if manager.ConfigPassword != "" {
@@ -373,14 +403,24 @@ func (manager Manager) verifyRcloneVersion(ctx context.Context) error {
 }
 
 func (manager Manager) validate() error {
-	if manager.Runner == nil || !filepath.IsAbs(manager.SnapshotDirectory) || !filepath.IsAbs(manager.StateDirectory) || !filepath.IsAbs(manager.ConfigPath) {
-		return errors.New("cloud manager paths and runner must be configured")
-	}
-	if manager.CryptRemote == "" || manager.BaseRemote == "" || manager.CryptRemote == manager.BaseRemote || manager.ExpectedBaseType == "" || strings.ContainsAny(manager.CryptRemote+manager.BaseRemote, ":/\\\r\n") {
-		return errors.New("cloud remote identities are invalid")
+	if err := manager.validateBase(); err != nil {
+		return err
 	}
 	if manager.CryptPassword == "" || manager.CryptPassword2 == "" || !validFingerprint(manager.ProtectionFingerprint) {
 		return errors.New("cloud recovery material is not configured")
+	}
+	return nil
+}
+
+func (manager Manager) validateBase() error {
+	if manager.Runner == nil || !filepath.IsAbs(manager.SnapshotDirectory) || !filepath.IsAbs(manager.StateDirectory) || !filepath.IsAbs(manager.ConfigPath) {
+		return errors.New("cloud manager paths and runner must be configured")
+	}
+	if manager.RecoveryPath != "" && (!filepath.IsAbs(manager.RecoveryPath) || filepath.Clean(manager.RecoveryPath) != manager.RecoveryPath) {
+		return errors.New("managed recovery path is invalid")
+	}
+	if manager.CryptRemote == "" || manager.BaseRemote == "" || manager.CryptRemote == manager.BaseRemote || manager.ExpectedBaseType == "" || strings.ContainsAny(manager.CryptRemote+manager.BaseRemote, ":/\\\r\n") {
+		return errors.New("cloud remote identities are invalid")
 	}
 	if !manager.AllowUnencryptedTest && manager.ConfigPassword == "" {
 		return errors.New("cloud configuration password is required")

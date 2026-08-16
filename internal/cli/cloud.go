@@ -27,6 +27,7 @@ type cloudOptions struct {
 	Rclone               string
 	JSON                 bool
 	Legacy               bool
+	Initialize           bool
 	configPassword       string
 	createConfigPassword bool
 }
@@ -66,7 +67,7 @@ func runCloudRecovery(args []string, stdout, stderr io.Writer, dependencies Depe
 	}
 	flags := flag.NewFlagSet("cloud recovery create", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	output := flags.String("output", "", "absolute path for the separate recovery file")
+	output := flags.String("output", "", "absolute path for an optional recovery-key export")
 	jsonOutput := flags.Bool("json", false, "write a JSON result")
 	if err := flags.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -83,9 +84,29 @@ func runCloudRecovery(args []string, stdout, stderr io.Writer, dependencies Depe
 		fmt.Fprintln(stderr, "Unable to resolve the recovery export path.")
 		return ExitUsage
 	}
-	material, err := cloudcore.GenerateRecovery(dependencies.Now())
+	paths, err := platform.Resolve(dependencies.Environment)
 	if err != nil {
-		fmt.Fprintln(stderr, "Unable to generate secure recovery material.")
+		fmt.Fprintln(stderr, "Unable to resolve the private cloud recovery path.")
+		return ExitRuntime
+	}
+	managedPath := filepath.Join(filepath.Dir(paths.CloudConfig), cloudcore.ManagedRecoveryFileName)
+	material, loadErr := cloudcore.LoadRecovery(managedPath)
+	if loadErr != nil {
+		if _, managedErr := os.Lstat(managedPath); managedErr == nil {
+			fmt.Fprintln(stderr, "The existing managed recovery key is missing or invalid; no new key was generated.")
+			return ExitRuntime
+		} else if !errors.Is(managedErr, os.ErrNotExist) {
+			fmt.Fprintln(stderr, "The existing managed recovery key could not be inspected safely; no new key was generated.")
+			return ExitRuntime
+		}
+		if _, statErr := os.Lstat(paths.CloudConfig); statErr == nil {
+			fmt.Fprintln(stderr, "An existing cloud connection has no usable managed recovery key. Import and verify the existing recovery key before exporting it; no new key was generated.")
+			return ExitRuntime
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			fmt.Fprintln(stderr, "The existing cloud configuration could not be inspected safely; no new key was generated.")
+			return ExitRuntime
+		}
+		fmt.Fprintln(stderr, "No managed recovery key is available. Connect Google Drive or import an existing recovery key before exporting an Advanced fallback.")
 		return ExitRuntime
 	}
 	if err := cloudcore.SaveRecovery(absolute, material); err != nil {
@@ -106,7 +127,7 @@ func runCloudRecovery(args []string, stdout, stderr io.Writer, dependencies Depe
 			return ExitRuntime
 		}
 	} else {
-		fmt.Fprintf(stdout, "Recovery material created: %s\nFingerprint: %s\nKeep this file separate from cloud snapshots. Losing it makes protected snapshots unrecoverable.\n", absolute, fingerprint)
+		fmt.Fprintf(stdout, "Recovery key exported: %s\nFingerprint: %s\nThis is an optional Advanced fallback; normal Google Drive recovery is managed automatically.\n", absolute, fingerprint)
 	}
 	return ExitOK
 }
@@ -122,7 +143,7 @@ func runCloudConnect(args []string, stdout, stderr io.Writer, dependencies Depen
 		return ExitUsage
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "Usage error: cloud connect requires --recovery-file and no positional arguments.")
+		fmt.Fprintln(stderr, "Usage error: cloud connect accepts no positional arguments.")
 		return ExitUsage
 	}
 	if options.Legacy {
@@ -134,16 +155,26 @@ func runCloudConnect(args []string, stdout, stderr io.Writer, dependencies Depen
 		return ExitRuntime
 	}
 	options.createConfigPassword = true
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, false)
 	if code != ExitOK {
 		return code
 	}
-	status, err := manager.ConnectGoogle(context.Background(), dependencies.GoogleClientID, dependencies.GoogleClientCredential, dependencies.Now())
+	var status cloudcore.Status
+	var err error
+	if options.Initialize {
+		status, err = manager.ConnectGoogleWithInitialization(context.Background(), dependencies.GoogleClientID, dependencies.GoogleClientCredential, dependencies.Now())
+	} else {
+		status, err = manager.ConnectGoogle(context.Background(), dependencies.GoogleClientID, dependencies.GoogleClientCredential, dependencies.Now())
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "Google Drive connection failed safely: %v\n", err)
 		return ExitRuntime
 	}
-	return writeCloudValue(stdout, stderr, options.JSON, status, "Google Drive connected with client-side protection.\n")
+	message := "Google Drive connected with client-side protection.\n"
+	if status.ConfigurationMessage != "" {
+		message += "Note: " + status.ConfigurationMessage + "\n"
+	}
+	return writeCloudValue(stdout, stderr, options.JSON, status, message)
 }
 
 func runCloudUnlock(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
@@ -170,7 +201,7 @@ func runCloudUnlock(args []string, stdout, stderr io.Writer, dependencies Depend
 		return ExitUsage
 	}
 	options.configPassword = password
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
 	if code != ExitOK {
 		return code
 	}
@@ -205,7 +236,7 @@ func runCloudStatus(args []string, stdout, stderr io.Writer, dependencies Depend
 		fmt.Fprintln(stderr, "Usage error: cloud status accepts no positional arguments.")
 		return ExitUsage
 	}
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
 	if code != ExitOK {
 		return code
 	}
@@ -214,7 +245,10 @@ func runCloudStatus(args []string, stdout, stderr io.Writer, dependencies Depend
 		fmt.Fprintf(stderr, "Cloud status check failed: %v\n", err)
 		return ExitRuntime
 	}
-	message := fmt.Sprintf("Cloud connected: %t\nClient-side protection: %t\nRecovery acknowledged: %t\nGoogle Drive scope: %s\nSnapshot folder: %s\nLegacy migration source: %t\n", status.Configured, status.Protected, status.RecoveryAcknowledged, status.Scope, status.Folder, status.Legacy)
+	message := fmt.Sprintf("Cloud connected: %t\nClient-side protection: %t\nRecovery acknowledged: %t\nGoogle Drive snapshot scope: %s\nOAuth scopes: %s\nSnapshot folder: %s\nLegacy migration source: %t\n", status.Configured, status.Protected, status.RecoveryAcknowledged, status.Scope, status.OAuthScopes, status.Folder, status.Legacy)
+	if status.ConfigurationMessage != "" {
+		message += "Note: " + status.ConfigurationMessage + "\n"
+	}
 	return writeCloudValue(stdout, stderr, options.JSON, status, message)
 }
 
@@ -245,7 +279,7 @@ func runCloudDisconnect(args []string, stdout, stderr io.Writer, dependencies De
 		}
 		options.configPassword = password
 	}
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
 	if code != ExitOK {
 		return code
 	}
@@ -290,7 +324,7 @@ func runCloudDisconnect(args []string, stdout, stderr io.Writer, dependencies De
 	if legacyPreserved {
 		fmt.Fprintln(stdout, "Legacy Google Drive connection preserved privately for migration and disconnected locally. Cloud and local snapshots were not removed.")
 	} else {
-		fmt.Fprintln(stdout, "Google Drive disconnected locally. Cloud snapshots, local snapshots, and the separate recovery file were not removed.")
+		fmt.Fprintln(stdout, "Google Drive disconnected locally. Cloud snapshots, local snapshots, managed recovery, and exported fallback keys were not removed.")
 	}
 	return ExitOK
 }
@@ -309,7 +343,7 @@ func runCloudList(args []string, stdout, stderr io.Writer, dependencies Dependen
 		fmt.Fprintln(stderr, "Usage error: cloud list accepts no positional arguments.")
 		return ExitUsage
 	}
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
 	if code != ExitOK {
 		return code
 	}
@@ -349,7 +383,7 @@ func runCloudUpload(args []string, stdout, stderr io.Writer, dependencies Depend
 		fmt.Fprintln(stderr, "Usage error: new uploads are not allowed through --legacy.")
 		return ExitUsage
 	}
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
 	if code != ExitOK {
 		return code
 	}
@@ -375,7 +409,7 @@ func runCloudDownload(args []string, stdout, stderr io.Writer, dependencies Depe
 		fmt.Fprintln(stderr, "Usage error: cloud download requires exactly one protected cloud snapshot name.")
 		return ExitUsage
 	}
-	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr)
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
 	if code != ExitOK {
 		return code
 	}
@@ -390,18 +424,15 @@ func runCloudDownload(args []string, stdout, stderr io.Writer, dependencies Depe
 
 func addCloudOptions(flags *flag.FlagSet) *cloudOptions {
 	options := &cloudOptions{}
-	flags.StringVar(&options.RecoveryFile, "recovery-file", "", "absolute path to separate recovery material")
+	flags.StringVar(&options.RecoveryFile, "recovery-file", "", "absolute path to an optional recovery-key fallback")
 	flags.StringVar(&options.Rclone, "rclone", "", "absolute path to the pinned rclone executable")
 	flags.BoolVar(&options.JSON, "json", false, "write a JSON result")
 	flags.BoolVar(&options.Legacy, "legacy", false, "use the preserved read-only v0.1.0 app-folder connection")
+	flags.BoolVar(&options.Initialize, "initialize", false, "after confirmation, create recovery data for an empty Google account")
 	return options
 }
 
-func buildCloudManager(ctx context.Context, options cloudOptions, dependencies Dependencies, stderr io.Writer) (cloudcore.Manager, int) {
-	if options.RecoveryFile == "" {
-		fmt.Fprintln(stderr, "Usage error: --recovery-file is required for protected cloud operations.")
-		return cloudcore.Manager{}, ExitUsage
-	}
+func buildCloudManager(ctx context.Context, options cloudOptions, dependencies Dependencies, stderr io.Writer, requireRecovery bool) (cloudcore.Manager, int) {
 	paths, err := platform.Resolve(dependencies.Environment)
 	if err != nil {
 		fmt.Fprintf(stderr, "Unable to resolve application paths: %v\n", err)
@@ -416,15 +447,33 @@ func buildCloudManager(ctx context.Context, options cloudOptions, dependencies D
 		configPath = filepath.Join(legacyDirectory, "rclone.conf")
 		passwordPath = filepath.Join(legacyDirectory, "config-password")
 	}
-	recoveryPath, err := filepath.Abs(options.RecoveryFile)
-	if err != nil {
-		fmt.Fprintln(stderr, "Unable to resolve the recovery file path.")
-		return cloudcore.Manager{}, ExitUsage
-	}
-	material, err := cloudcore.LoadRecovery(recoveryPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "Unable to load recovery material: %v\n", err)
-		return cloudcore.Manager{}, ExitRuntime
+	managedRecoveryPath := filepath.Join(filepath.Dir(paths.CloudConfig), cloudcore.ManagedRecoveryFileName)
+	var material *cloudcore.RecoveryMaterial
+	manualRecovery := false
+	if options.RecoveryFile != "" {
+		recoveryPath, pathErr := filepath.Abs(options.RecoveryFile)
+		if pathErr != nil {
+			fmt.Fprintln(stderr, "Unable to resolve the recovery file path.")
+			return cloudcore.Manager{}, ExitUsage
+		}
+		loaded, loadErr := cloudcore.LoadRecovery(recoveryPath)
+		if loadErr != nil {
+			fmt.Fprintf(stderr, "Unable to load recovery material: %v\n", loadErr)
+			return cloudcore.Manager{}, ExitRuntime
+		}
+		material = &loaded
+		manualRecovery = true
+	} else if requireRecovery {
+		loaded, loadErr := cloudcore.LoadRecovery(managedRecoveryPath)
+		if loadErr != nil {
+			if errors.Is(loadErr, os.ErrNotExist) || strings.Contains(loadErr.Error(), "missing or not a private regular file") {
+				fmt.Fprintln(stderr, "Protected cloud recovery is not configured. Connect Google Drive first or import a recovery key from Advanced options.")
+			} else {
+				fmt.Fprintf(stderr, "Unable to load managed recovery material: %v\n", loadErr)
+			}
+			return cloudcore.Manager{}, ExitRuntime
+		}
+		material = &loaded
 	}
 	rclonePath := options.Rclone
 	if rclonePath == "" {
@@ -454,10 +503,13 @@ func buildCloudManager(ctx context.Context, options cloudOptions, dependencies D
 		fmt.Fprintf(stderr, "Unable to initialize the cloud command boundary: %v\n", err)
 		return cloudcore.Manager{}, ExitRuntime
 	}
-	protected, err := cloudcore.ProtectRecovery(ctx, runner, material)
-	if err != nil {
-		fmt.Fprintf(stderr, "Unable to prepare recovery material: %v\n", err)
-		return cloudcore.Manager{}, ExitRuntime
+	var protected cloudcore.ProtectedRecovery
+	if material != nil {
+		protected, err = cloudcore.ProtectRecovery(ctx, runner, *material)
+		if err != nil {
+			fmt.Fprintf(stderr, "Unable to prepare recovery material: %v\n", err)
+			return cloudcore.Manager{}, ExitRuntime
+		}
 	}
 	configPassword := options.configPassword
 	if configPassword == "" {
@@ -481,8 +533,10 @@ func buildCloudManager(ctx context.Context, options cloudOptions, dependencies D
 	}
 	manager := cloudcore.Manager{
 		Runner: runner, SnapshotDirectory: paths.Snapshots, StateDirectory: stateDirectory, ConfigPath: configPath,
+		RecoveryPath:   managedRecoveryPath,
 		ConfigPassword: configPassword, CryptRemote: cloudCryptRemote, BaseRemote: cloudBaseRemote, BasePath: cloudcore.GoogleDriveBasePath, ExpectedBaseType: "drive",
 		ProtectionFingerprint: protected.MaterialFingerprint, CryptPassword: protected.Password, CryptPassword2: protected.Password2,
+		RecoveryMaterial: material, ManualRecovery: manualRecovery,
 		AllowUnencryptedTest: dependencies.CloudAllowUnencryptedTest, Limits: limits.Default(),
 	}
 	return manager, ExitOK

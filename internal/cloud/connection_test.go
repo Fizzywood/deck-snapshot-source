@@ -1,12 +1,16 @@
 package cloud
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -64,6 +68,9 @@ func (runner *connectionRunner) Run(_ context.Context, request Request) (Result,
 	}
 	if request.Args[0] == "version" {
 		return Result{Stdout: expectedRcloneVersion + "\n"}, nil
+	}
+	if request.Args[0] == "obscure" {
+		return Result{Stdout: "obscured-recovery-value\n"}, nil
 	}
 	if request.Args[0] == "secure-config-create" {
 		var input secureConfigInput
@@ -154,12 +161,13 @@ func TestConnectGoogleAndDisconnect(t *testing.T) {
 	runner := &connectionRunner{configPath: configPath}
 	manager := Manager{
 		Runner: runner, SnapshotDirectory: filepath.Join(root, "data", "snapshots"), StateDirectory: filepath.Join(root, "state"), ConfigPath: configPath,
+		RecoveryPath:   filepath.Join(root, "config", "cloud", ManagedRecoveryFileName),
 		ConfigPassword: "synthetic-config-password", CryptRemote: "deck-snapshot-crypt", BaseRemote: "deck-snapshot-drive", BasePath: GoogleDriveBasePath, ExpectedBaseType: "drive",
 		ProtectionFingerprint: strings.Repeat("a", 64), CryptPassword: "obscured-primary", CryptPassword2: "obscured-secondary",
 		AllowUnencryptedTest: true, Limits: limits.Default(),
 	}
 	manager.googleOAuth = testGoogleOAuthDependencies(t)
-	status, err := manager.ConnectGoogle(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC))
+	status, err := manager.ConnectGoogleWithInitialization(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC))
 	if err != nil || !status.Configured || !status.Protected || !status.RecoveryAcknowledged || status.Legacy || status.Scope != "drive.file" || status.Folder != "My Drive/"+GoogleDriveBasePath {
 		t.Fatalf("ConnectGoogle() = %#v, %v", status, err)
 	}
@@ -183,6 +191,78 @@ func TestConnectGoogleAndDisconnect(t *testing.T) {
 	}
 }
 
+func TestConnectGoogleRequiresExplicitSetupForAnEmptyAccount(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config", "cloud", "rclone.conf")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &connectionRunner{configPath: configPath}
+	manager := Manager{
+		Runner: runner, SnapshotDirectory: filepath.Join(root, "snapshots"), StateDirectory: filepath.Join(root, "state"), ConfigPath: configPath,
+		RecoveryPath:   filepath.Join(root, "config", "cloud", ManagedRecoveryFileName),
+		ConfigPassword: "synthetic-config-password", CryptRemote: "deck-snapshot-crypt", BaseRemote: "deck-snapshot-drive", BasePath: GoogleDriveBasePath, ExpectedBaseType: "drive",
+		AllowUnencryptedTest: true, Limits: limits.Default(),
+	}
+	manager.googleOAuth = testGoogleOAuthDependenciesWithState(t, false, nil)
+	if _, err := manager.ConnectGoogle(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now()); err == nil || !strings.Contains(err.Error(), "confirm setup") {
+		t.Fatalf("empty account without confirmation = %v", err)
+	}
+	if _, err := os.Lstat(configPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty account left a cloud configuration: %v", err)
+	}
+}
+
+func TestConnectGoogleRecoversFromExistingAppDataWithoutManualFile(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config", "cloud", "rclone.conf")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	material, err := GenerateRecovery(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &connectionRunner{configPath: configPath}
+	manager := Manager{
+		Runner: runner, SnapshotDirectory: filepath.Join(root, "snapshots"), StateDirectory: filepath.Join(root, "state"), ConfigPath: configPath,
+		RecoveryPath:   filepath.Join(root, "config", "cloud", ManagedRecoveryFileName),
+		ConfigPassword: "synthetic-config-password", CryptRemote: "deck-snapshot-crypt", BaseRemote: "deck-snapshot-drive", BasePath: GoogleDriveBasePath, ExpectedBaseType: "drive",
+		AllowUnencryptedTest: true, Limits: limits.Default(),
+	}
+	manager.googleOAuth = testGoogleOAuthDependenciesWithState(t, false, &material)
+	status, err := manager.ConnectGoogle(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now())
+	if err != nil || !status.RecoveryAcknowledged {
+		t.Fatalf("same-account appData recovery = %#v, %v", status, err)
+	}
+	loaded, err := LoadRecovery(manager.RecoveryPath)
+	if err != nil || loaded != material {
+		t.Fatalf("managed recovery copy = %#v, %v", loaded, err)
+	}
+}
+
+func TestConnectGoogleNeverGeneratesReplacementForVisibleSnapshots(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config", "cloud", "rclone.conf")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &connectionRunner{configPath: configPath}
+	manager := Manager{
+		Runner: runner, SnapshotDirectory: filepath.Join(root, "snapshots"), StateDirectory: filepath.Join(root, "state"), ConfigPath: configPath,
+		RecoveryPath:   filepath.Join(root, "config", "cloud", ManagedRecoveryFileName),
+		ConfigPassword: "synthetic-config-password", CryptRemote: "deck-snapshot-crypt", BaseRemote: "deck-snapshot-drive", BasePath: GoogleDriveBasePath, ExpectedBaseType: "drive",
+		AllowUnencryptedTest: true, Limits: limits.Default(),
+	}
+	manager.googleOAuth = testGoogleOAuthDependenciesWithState(t, true, nil)
+	if _, err := manager.ConnectGoogleWithInitialization(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now()); err == nil || !strings.Contains(err.Error(), "original recovery key") {
+		t.Fatalf("visible snapshots without recovery key = %v", err)
+	}
+	if _, err := os.Lstat(manager.RecoveryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement recovery key was generated: %v", err)
+	}
+}
+
 func TestConnectGoogleRejectsUnreachableAuthorizationBeforeAcknowledgement(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "config", "cloud", "rclone.conf")
@@ -197,7 +277,7 @@ func TestConnectGoogleRejectsUnreachableAuthorizationBeforeAcknowledgement(t *te
 		AllowUnencryptedTest: true, Limits: limits.Default(),
 	}
 	manager.googleOAuth = testGoogleOAuthDependencies(t)
-	if _, err := manager.ConnectGoogle(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now()); err == nil || !strings.Contains(err.Error(), "reachability") {
+	if _, err := manager.ConnectGoogleWithInitialization(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now()); err == nil || !strings.Contains(err.Error(), "reachability") {
 		t.Fatalf("ConnectGoogle() error = %v", err)
 	}
 	if _, err := os.Lstat(configPath); !errors.Is(err, os.ErrNotExist) {
@@ -246,7 +326,7 @@ func TestConnectGoogleCleansPartialConfiguration(t *testing.T) {
 		AllowUnencryptedTest: true, Limits: limits.Default(),
 	}
 	manager.googleOAuth = testGoogleOAuthDependencies(t)
-	if _, err := manager.ConnectGoogle(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now()); err == nil || !strings.Contains(err.Error(), "encrypted cloud configuration") {
+	if _, err := manager.ConnectGoogleWithInitialization(context.Background(), "synthetic.apps.googleusercontent.com", testGoogleDesktopCredential, time.Now()); err == nil || !strings.Contains(err.Error(), "encrypted cloud configuration") {
 		t.Fatalf("ConnectGoogle() error = %v", err)
 	}
 	if _, err := os.Lstat(configPath); !errors.Is(err, os.ErrNotExist) {
@@ -255,9 +335,84 @@ func TestConnectGoogleCleansPartialConfiguration(t *testing.T) {
 }
 
 func testGoogleOAuthDependencies(t *testing.T) googleOAuthDependencies {
+	return testGoogleOAuthDependenciesWithState(t, false, nil)
+}
+
+func testGoogleOAuthDependenciesWithState(t *testing.T, existingSnapshots bool, existingMaterial *RecoveryMaterial) googleOAuthDependencies {
 	t.Helper()
 	expectedChallenge := ""
+	var recoveryBody []byte
+	if existingMaterial != nil {
+		var encodeErr error
+		recoveryBody, encodeErr = encodeRecovery(*existingMaterial)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+	}
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/token" {
+			if request.Method == http.MethodPost {
+				if request.URL.Path != "/upload/drive/v3/files" || request.URL.Query().Get("uploadType") != "multipart" {
+					response.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+				if err != nil || mediaType != "multipart/related" {
+					response.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				reader := multipart.NewReader(request.Body, parameters["boundary"])
+				for {
+					part, partErr := reader.NextPart()
+					if errors.Is(partErr, io.EOF) {
+						break
+					}
+					if partErr != nil {
+						response.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					contents, readErr := io.ReadAll(part)
+					_ = part.Close()
+					if readErr == nil && bytes.Contains(contents, []byte(`"crypt_password"`)) {
+						recoveryBody = contents
+					}
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(response, `{"id":"synthetic-recovery","name":"deck-snapshot-recovery-v1.json","mimeType":"application/json"}`)
+				return
+			}
+			if request.Method == http.MethodGet && request.URL.Query().Get("alt") == "media" {
+				if len(recoveryBody) == 0 {
+					response.WriteHeader(http.StatusNotFound)
+					return
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write(recoveryBody)
+				return
+			}
+			if request.Method == http.MethodGet && request.URL.Query().Get("spaces") == "appDataFolder" && len(recoveryBody) > 0 {
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(response, `{"files":[{"id":"synthetic-recovery","name":"deck-snapshot-recovery-v1.json","mimeType":"application/json","size":"%d"}]}`, len(recoveryBody))
+				return
+			}
+			if request.Method == http.MethodGet && request.URL.Query().Get("spaces") == "drive" && existingSnapshots {
+				query := request.URL.Query().Get("q")
+				switch {
+				case strings.Contains(query, "'root' in parents"):
+					_, _ = io.WriteString(response, `{"files":[{"id":"synthetic-root","name":"Deck Snapshot","mimeType":"application/vnd.google-apps.folder"}]}`)
+				case strings.Contains(query, "'synthetic-root' in parents"):
+					_, _ = io.WriteString(response, `{"files":[{"id":"synthetic-snapshots","name":"Snapshots","mimeType":"application/vnd.google-apps.folder"}]}`)
+				case strings.Contains(query, "'synthetic-snapshots' in parents"):
+					_, _ = io.WriteString(response, `{"files":[{"id":"synthetic-object","name":"encrypted-object","mimeType":"application/octet-stream","size":"1"}]}`)
+				default:
+					_, _ = io.WriteString(response, `{"files":[]}`)
+				}
+				return
+			}
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(response, `{"files":[]}`)
+			return
+		}
 		if request.Method != http.MethodPost {
 			t.Errorf("token exchange method = %s", request.Method)
 			response.WriteHeader(http.StatusMethodNotAllowed)
@@ -278,12 +433,14 @@ func testGoogleOAuthDependencies(t *testing.T) googleOAuthDependencies {
 			return
 		}
 		response.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(response, `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","scope":"https://www.googleapis.com/auth/drive.file","expires_in":3600}`)
+		_, _ = io.WriteString(response, `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","scope":"https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.appdata","expires_in":3600}`)
 	}))
 	t.Cleanup(tokenServer.Close)
 	return googleOAuthDependencies{
 		authorizationEndpoint: googleAuthorizationEndpoint,
-		tokenEndpoint:         tokenServer.URL,
+		tokenEndpoint:         tokenServer.URL + "/token",
+		driveAPIEndpoint:      tokenServer.URL + "/drive/v3/files",
+		driveUploadEndpoint:   tokenServer.URL + "/upload/drive/v3/files",
 		client:                tokenServer.Client(),
 		now:                   func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) },
 		timeout:               5 * time.Second,
@@ -294,7 +451,7 @@ func testGoogleOAuthDependencies(t *testing.T) googleOAuthDependencies {
 			}
 			query := parsed.Query()
 			expectedChallenge = query.Get("code_challenge")
-			if parsed.Scheme != "https" || parsed.Hostname() != "accounts.google.com" || query.Get("scope") != googleDriveFileScope ||
+			if parsed.Scheme != "https" || parsed.Hostname() != "accounts.google.com" || query.Get("scope") != strings.Join(googleDriveOAuthScopes, " ") ||
 				query.Get("code_challenge_method") != "S256" || expectedChallenge == "" || query.Get("client_secret") != "" {
 				return errors.New("unsafe authorization URL")
 			}

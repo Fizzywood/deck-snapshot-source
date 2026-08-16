@@ -72,7 +72,7 @@ func runSettingsSet(args []string, stdout, stderr io.Writer, dependencies Depend
 	flags := flag.NewFlagSet("settings set", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	autoUpload := flags.String("auto-upload", "", "true or false")
-	recoveryFile := flags.String("recovery-file", "", "absolute path to separate recovery material")
+	recoveryFile := flags.String("recovery-file", "", "absolute path to an optional recovery-key fallback")
 	jsonOutput := flags.Bool("json", false, "write a JSON result")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

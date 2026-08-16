@@ -19,7 +19,8 @@ func TestRunAllowsOnlyGoogleAndScrubsSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	environment := map[string]string{
-		"HOME": root, "XDG_DATA_HOME": root, "DISPLAY": ":0",
+		"HOME": root, "XDG_DATA_HOME": root, "DISPLAY": ":0", "XDG_SESSION_TYPE": "wayland",
+		"XDG_SESSION_DESKTOP": "KDE", "XDG_SESSION_ID": "5", "XDG_SEAT": "seat0",
 		"RCLONE_CONFIG_PASS": "must-not-pass", "RCLONE_DRIVE_CLIENT_SECRET": "must-not-pass",
 	}
 	lookup := func(key string) (string, bool) {
@@ -103,10 +104,144 @@ func TestRunRejectsUnsafeDesktopResponsesAndFailures(t *testing.T) {
 	}
 }
 
+func TestRunUsesDesktopPortalBeforeHandlerFallback(t *testing.T) {
+	launched := false
+	deps := dependencies{
+		lookupEnv: func(key string) (string, bool) {
+			if key == "DISPLAY" {
+				return ":0", true
+			}
+			return "", false
+		},
+		launchPortal: func(target string, environment []string) error {
+			if target != "https://accounts.google.com/" {
+				t.Fatalf("portal target = %q", target)
+			}
+			if !hasGraphicalSession(environment) {
+				t.Fatal("portal did not receive graphical session environment")
+			}
+			launched = true
+			return nil
+		},
+		queryDefault: func([]string) (string, error) {
+			t.Fatal("portal success reached handler fallback")
+			return "", nil
+		},
+	}
+	if code := run([]string{"https://accounts.google.com/"}, deps); code != 0 || !launched {
+		t.Fatalf("run() = %d, launched=%v", code, launched)
+	}
+}
+
+func TestRunRejectsHeadlessSessionBeforeDispatch(t *testing.T) {
+	queried := false
+	deps := dependencies{
+		lookupEnv: func(key string) (string, bool) {
+			if key == "HOME" {
+				return t.TempDir(), true
+			}
+			return "", false
+		},
+		stat: os.Stat,
+		queryDefault: func([]string) (string, error) {
+			queried = true
+			return "org.mozilla.firefox.desktop", nil
+		},
+		launch: func(string, string, []string) error {
+			t.Fatal("headless session reached browser launch")
+			return nil
+		},
+	}
+	if code := run([]string{"https://accounts.google.com/"}, deps); code != failureExitCode {
+		t.Fatalf("run(headless) = %d", code)
+	}
+	if queried {
+		t.Fatal("headless session queried a browser handler")
+	}
+}
+
+func TestResolveDesktopFilePrefersFlatpakExport(t *testing.T) {
+	root := t.TempDir()
+	fixture := filepath.Join(root, "desktop-entry")
+	if err := os.WriteFile(fixture, []byte("[Desktop Entry]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	desktop := "org.mozilla.firefox.desktop"
+	flatpakPath := filepath.Join(root, "flatpak", "exports", "share", "applications", desktop)
+	systemDirectory := filepath.Join(root, "system-data")
+	systemPath := filepath.Join(systemDirectory, "applications", desktop)
+	fixtureInfo, err := os.Stat(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checked []string
+	path, err := resolveDesktopFile(desktop, func(key string) (string, bool) {
+		switch key {
+		case "HOME", "XDG_DATA_HOME":
+			return root, true
+		case "XDG_DATA_DIRS":
+			return systemDirectory, true
+		default:
+			return "", false
+		}
+	}, func(candidate string) (os.FileInfo, error) {
+		checked = append(checked, candidate)
+		if candidate == flatpakPath {
+			return fixtureInfo, nil
+		}
+		return nil, os.ErrNotExist
+	})
+	if err != nil || path != flatpakPath {
+		t.Fatalf("resolveDesktopFile() = %q, %v; checked=%q", path, err, checked)
+	}
+	for _, candidate := range checked {
+		if candidate == systemPath {
+			t.Fatalf("system wrapper was checked before Flatpak export: %q", checked)
+		}
+	}
+}
+
+func TestResolveDesktopFileUsesGlobalFlatpakExportOnLinux(t *testing.T) {
+	globalDirectory := "/var/lib/flatpak/exports/share"
+	if !filepath.IsAbs(globalDirectory) {
+		t.Skip("the SteamOS Flatpak export root is not a native absolute path on this host")
+	}
+	root := t.TempDir()
+	fixture := filepath.Join(root, "desktop-entry")
+	if err := os.WriteFile(fixture, []byte("[Desktop Entry]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixtureInfo, err := os.Stat(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desktop := "org.mozilla.firefox.desktop"
+	want := filepath.Join(globalDirectory, "applications", desktop)
+	path, err := resolveDesktopFile(desktop, func(key string) (string, bool) {
+		switch key {
+		case "HOME", "XDG_DATA_HOME":
+			return root, true
+		case "XDG_DATA_DIRS":
+			return filepath.Join(root, "system-data"), true
+		default:
+			return "", false
+		}
+	}, func(candidate string) (os.FileInfo, error) {
+		if candidate == want {
+			return fixtureInfo, nil
+		}
+		return nil, os.ErrNotExist
+	})
+	if err != nil || path != want {
+		t.Fatalf("resolveDesktopFile() = %q, %v", path, err)
+	}
+}
+
 func assertSafeEnvironment(t *testing.T, environment []string) {
 	t.Helper()
 	joined := strings.Join(environment, "\n")
-	if strings.Contains(joined, "RCLONE_CONFIG_PASS") || strings.Contains(joined, "RCLONE_DRIVE_CLIENT_SECRET") || !strings.Contains(joined, "DISPLAY=:0") {
+	if strings.Contains(joined, "RCLONE_CONFIG_PASS") || strings.Contains(joined, "RCLONE_DRIVE_CLIENT_SECRET") ||
+		!strings.Contains(joined, "DISPLAY=:0") || !strings.Contains(joined, "XDG_SESSION_TYPE=wayland") {
 		t.Fatalf("unsafe browser environment: %q", environment)
 	}
 }

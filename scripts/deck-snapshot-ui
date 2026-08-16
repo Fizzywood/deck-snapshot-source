@@ -6,10 +6,12 @@ CLI="$APP_DIR/deck-snapshot"
 KDIALOG_BIN=${KDIALOG:-kdialog}
 RECOVERY_FILE=
 SELECTED_SNAPSHOT=
+SELECTED_SNAPSHOT_LOCATION=
 UNINSTALLED=0
 QDBUS_BIN=
 PROGRESS_REF=()
 BACKUP_LOCK_FD=
+DECKY_URL="https://github.com/SteamDeckHomebrew/decky-loader"
 
 if [[ ! -x "$CLI" ]]; then
   printf 'Deck Snapshot executable is missing: %s\n' "$CLI" >&2
@@ -158,12 +160,13 @@ ensure_recovery_file() {
 
 cloud_command() {
   local output action
+  local -a recovery_option=()
   action=$1
   shift
-  if ! ensure_recovery_file; then
-    return 1
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+    recovery_option=(--recovery-file "$RECOVERY_FILE")
   fi
-  if output=$("$CLI" cloud "$action" --recovery-file "$RECOVERY_FILE" "$@" 2>&1); then
+  if output=$("$CLI" cloud "$action" "${recovery_option[@]}" "$@" 2>&1); then
     show_output "Deck Snapshot" "$output"
     return 0
   fi
@@ -175,24 +178,44 @@ cloud_command() {
 
 create_recovery() {
   local destination output
-  destination=$("$KDIALOG" --title "Save recovery material" --getsavefilename "$HOME/deck-snapshot-recovery.json" '*.json|JSON files') || return
+  destination=$("$KDIALOG" --title "Export recovery key" --getsavefilename "$HOME/deck-snapshot-recovery.json" '*.json|JSON files') || return
   [[ -n "$destination" ]] || return
   if output=$("$CLI" cloud recovery create --output "$destination" 2>&1); then
     RECOVERY_FILE=$destination
-    show_output "Recovery material created" "$output"
+    show_output "Recovery key exported" "$output"
   else
     show_error "$output"
   fi
 }
 
-connect_cloud() {
-  local output
-  if ! ensure_recovery_file; then
+import_recovery() {
+  local selected
+  selected=$("$KDIALOG" --title "Import recovery key" --getopenfilename "$HOME" '*.json|Deck Snapshot recovery files') || return
+  if [[ -z "$selected" || ! -f "$selected" ]]; then
     return
   fi
-  "$KDIALOG" --title "Connect Google Drive" --msgbox "Your system browser will open for Google authorization. Deck Snapshot requests only access to files it creates and stores snapshots at My Drive/Deck Snapshot/Snapshots/."
-  if output=$("$CLI" cloud connect --recovery-file "$RECOVERY_FILE" 2>&1); then
+  RECOVERY_FILE=$selected
+  "$CLI" settings set --recovery-file "$RECOVERY_FILE" >/dev/null 2>&1 || true
+  if "$KDIALOG" --title "Import recovery key" --warningyesno "Use this recovery key during a Google Drive reconnect? Deck Snapshot will verify it against the private recovery object and existing encrypted snapshots before changing local cloud state."; then
+    connect_or_reconnect_cloud
+  fi
+}
+
+connect_cloud() {
+  local output
+  local -a recovery_option=()
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+    recovery_option=(--recovery-file "$RECOVERY_FILE")
+  fi
+  "$KDIALOG" --title "Connect Google Drive" --msgbox "Your system browser will open for Google authorization. Deck Snapshot requests access only to its visible snapshots and its private recovery configuration."
+  if output=$("$CLI" cloud connect "${recovery_option[@]}" 2>&1); then
     show_output "Google Drive connected" "$output"
+  elif printf '%s\n' "$output" | grep -F 'confirm setup with --initialize' >/dev/null && "$KDIALOG" --title "Set up encrypted cloud recovery" --warningyesno "No matching Deck Snapshot recovery data or encrypted backups were found in this Google account. This may be a new account or the wrong Google account. Set up managed encrypted recovery now? Any selected recovery key will be reused; no cloud snapshot will be changed."; then
+    if output=$("$CLI" cloud connect --initialize "${recovery_option[@]}" 2>&1); then
+      show_output "Google Drive connected" "$output"
+    else
+      show_error "$output"
+    fi
   else
     show_error "$output"
   fi
@@ -200,8 +223,12 @@ connect_cloud() {
 
 disconnect_cloud() {
   local output password
-  if ! ensure_recovery_file; then
+  local -a recovery_option=()
+  if [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/deck-snapshot/cloud/recovery.json" ]] && ! ensure_recovery_file; then
     return 1
+  fi
+  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+    recovery_option=(--recovery-file "$RECOVERY_FILE")
   fi
   if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && ! -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
     password=$("$KDIALOG" --title "Preserve v0.1.0 cloud connection" --password "Enter the existing cloud configuration password once so the legacy connection can be verified and preserved locally before disconnecting:") || return 1
@@ -218,7 +245,7 @@ disconnect_cloud() {
       return 1
     fi
     password=
-  elif ! output=$("$CLI" cloud disconnect --recovery-file "$RECOVERY_FILE" 2>&1); then
+  elif ! output=$("$CLI" cloud disconnect "${recovery_option[@]}" 2>&1); then
     if "$KDIALOG" --title "Disconnect unavailable" --warningyesno "The local connection could not be forgotten safely. No cloud or local snapshot was removed.\n\nView redacted technical details?"; then
       show_output "Disconnect details" "$output"
     fi
@@ -229,7 +256,7 @@ disconnect_cloud() {
 
 connect_or_reconnect_cloud() {
   if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" ]]; then
-    if ! "$KDIALOG" --title "Reconnect Google Drive" --warningyesno "Reconnect by forgetting the current local authorization and opening Google again? Cloud snapshots, local snapshots, and separate recovery material will not be removed."; then
+    if ! "$KDIALOG" --title "Reconnect Google Drive" --warningyesno "Reconnect by forgetting the current local authorization and opening Google again? Cloud snapshots, managed recovery, and exported fallback keys will not be removed."; then
       return
     fi
     if ! disconnect_cloud; then
@@ -259,6 +286,7 @@ unlock_legacy_cloud() {
 
 create_snapshot() {
   local output snapshot_path settings upload_output storage_state cloud_note cloud_display result_title lock_status
+  local -a recovery_option=()
   local cloud_expected=false upload_failed=false
   begin_backup_lock
   lock_status=$?
@@ -285,13 +313,15 @@ create_snapshot() {
       cloud_expected=true
       if [[ -n "$snapshot_path" && -f "$snapshot_path" ]]; then
         close_progress
-        if ! ensure_recovery_file; then
-          cloud_note="Recovery file required"
-        elif ! start_progress "Uploading the protected backup to Google Drive…"; then
+        if ! start_progress "Uploading the protected backup to Google Drive…"; then
           cloud_note="Upload not started because progress could not be displayed"
         else
+          recovery_option=()
+          if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+            recovery_option=(--recovery-file "$RECOVERY_FILE")
+          fi
           while true; do
-            if upload_output=$("$CLI" cloud upload --recovery-file "$RECOVERY_FILE" "$snapshot_path" 2>&1); then
+            if upload_output=$("$CLI" cloud upload "${recovery_option[@]}" "$snapshot_path" 2>&1); then
               storage_state="Local + Cloud"
               cloud_note="Stored"
               upload_failed=false
@@ -345,9 +375,10 @@ create_snapshot() {
 choose_snapshot() {
   local purpose=${1:-Snapshots}
   local directory file key choice path output name local_mark cloud_mark legacy_mark label display_time location_label timestamp
-  local -a entries=() legacy_option=() names=() sorted_names=()
+  local -a entries=() legacy_option=() recovery_option=() names=() sorted_names=()
   local -A local_seen=() cloud_seen=() legacy_seen=() all_seen=()
   SELECTED_SNAPSHOT=
+  SELECTED_SNAPSHOT_LOCATION=
   directory="$HOME/.local/share/deck-snapshot/snapshots"
   shopt -s nullglob
   for file in "$directory"/*.tar.gz; do
@@ -356,8 +387,11 @@ choose_snapshot() {
     if [[ -z "${all_seen[$name]:-}" ]]; then names+=("$name"); all_seen["$name"]=1; fi
   done
   shopt -u nullglob
-  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
-    if output=$("$CLI" cloud list --recovery-file "$RECOVERY_FILE" 2>/dev/null); then
+  if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+    if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+      recovery_option=(--recovery-file "$RECOVERY_FILE")
+    fi
+    if output=$("$CLI" cloud list "${recovery_option[@]}" 2>/dev/null); then
       while IFS=' ' read -r name _; do
         if [[ "$name" =~ ^deck-snapshot-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
           cloud_seen["$name"]=1
@@ -411,10 +445,19 @@ choose_snapshot() {
   choice=$("$KDIALOG" --title "Deck Snapshot — $purpose" --menu "Choose a backup:" "${entries[@]}") || return
   key=${choice%%:*}
   name=${choice#*:}
+  location_label=
+  [[ -n "${local_seen[$name]:-}" ]] && location_label="Local"
+  [[ -n "${cloud_seen[$name]:-}" ]] && location_label+="${location_label:+ + }Google Drive"
+  [[ -n "${legacy_seen[$name]:-}" ]] && location_label+="${location_label:+ + }v0.1.0 cloud"
   if [[ "$key" == "cloud" || "$key" == "legacy" ]]; then
     legacy_option=()
     if [[ "$key" == "legacy" ]]; then legacy_option=(--legacy); fi
-    if ! output=$("$CLI" cloud download "${legacy_option[@]}" --recovery-file "$RECOVERY_FILE" "$name" 2>&1); then
+    if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+      recovery_option=(--recovery-file "$RECOVERY_FILE")
+    else
+      recovery_option=()
+    fi
+    if ! output=$("$CLI" cloud download "${legacy_option[@]}" "${recovery_option[@]}" "$name" 2>&1); then
       if "$KDIALOG" --title "Snapshot download failed" --warningyesno "The cloud snapshot could not be downloaded and validated. No local snapshot was replaced.\n\nView redacted technical details?"; then
         show_output "Snapshot download details" "$output"
       fi
@@ -429,6 +472,36 @@ choose_snapshot() {
     return 1
   fi
   SELECTED_SNAPSHOT=$path
+  SELECTED_SNAPSHOT_LOCATION=$location_label
+}
+
+snapshot_summary_dialog() {
+  local details=$1 snapshot_id created plugins css_themes artwork warnings validation summary choice
+  snapshot_id=$(printf '%s\n' "$details" | sed -n 's/^Snapshot: //p' | head -n 1)
+  created=$(printf '%s\n' "$details" | sed -n 's/^Created: //p' | head -n 1)
+  plugins=$(printf '%s\n' "$details" | sed -n 's/^Plugins: //p' | head -n 1)
+  css_themes=$(printf '%s\n' "$details" | sed -n 's/^CSS themes\/profiles: //p' | head -n 1)
+  artwork=$(printf '%s\n' "$details" | sed -n 's/^Artwork: //p' | head -n 1)
+  warnings=$(printf '%s\n' "$details" | sed -n 's/^Warnings: //p' | head -n 1)
+  [[ -n "$snapshot_id" ]] || snapshot_id="Unknown"
+  [[ -n "$created" ]] || created="Unknown"
+  [[ -n "$plugins" ]] || plugins="Unknown"
+  [[ -n "$css_themes" ]] || css_themes="Unknown"
+  [[ -n "$artwork" ]] || artwork="Unknown"
+  [[ -n "$warnings" ]] || warnings="Unknown"
+  validation="Valid"
+  if [[ "$warnings" =~ ^[0-9]+$ && "$warnings" != 0 ]]; then
+    validation="Valid with $warnings warnings"
+  fi
+  summary=$(printf 'Backup: %s\nBackup date/time: %s\nValidation: %s\nDecky plugins: %s\nCSS Loader themes/profiles: %s\nSteam artwork: %s\nStorage: %s' \
+    "$snapshot_id" "$created" "$validation" "$plugins" "$css_themes" "$artwork" \
+    "${SELECTED_SNAPSHOT_LOCATION:-Unknown}")
+  choice=$("$KDIALOG" --title "Snapshot details" --menu "$summary" \
+    restore "Restore this backup" \
+    close "Close") || return
+  if [[ "$choice" == restore ]]; then
+    plan_restore_path "$SELECTED_SNAPSHOT" "$details"
+  fi
 }
 
 snapshot_browser() {
@@ -440,7 +513,7 @@ snapshot_browser() {
     show_error "$output"
     return
   fi
-  show_output "Snapshot details" "$output"
+  snapshot_summary_dialog "$output"
 }
 
 list_local() {
@@ -454,6 +527,9 @@ list_local() {
 
 upload_snapshot() {
   local path
+  if [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/deck-snapshot/cloud/recovery.json" ]] && ! ensure_recovery_file; then
+    return
+  fi
   path=$("$KDIALOG" --title "Upload protected snapshot" --getopenfilename "$HOME/.local/share/deck-snapshot/snapshots" '*.tar.gz|Deck Snapshot archives') || return
   [[ -n "$path" ]] || return
   cloud_command upload "$path"
@@ -466,9 +542,55 @@ download_snapshot() {
   cloud_command download "$name"
 }
 
+decky_installed() {
+  [[ -d "$HOME/homebrew/plugins" && ! -L "$HOME/homebrew" && ! -L "$HOME/homebrew/plugins" ]]
+}
+
+open_decky_page() {
+  if ! command -v xdg-open >/dev/null 2>&1 || ! xdg-open "$DECKY_URL" >/dev/null 2>&1; then
+    show_error "The official Decky Loader page could not be opened. Open this URL manually:\n$DECKY_URL"
+  fi
+}
+
+ensure_decky_for_restore() {
+  local choice
+  while ! decky_installed; do
+    choice=$("$KDIALOG" --title "Decky Loader — Not installed" --menu \
+      "Decky Loader is required to restore Decky plugins and their settings." \
+      get_decky "Get Decky" \
+      check_again "Check again" \
+      close "Close") || return 1
+    case "$choice" in
+      get_decky) open_decky_page ;;
+      check_again) ;;
+      close) return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+snapshot_requires_decky() {
+  local details=$1 count
+  count=$(printf '%s\n' "$details" | sed -n 's/^Plugins: //p' | head -n 1)
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] && return 0
+  count=$(printf '%s\n' "$details" | sed -n 's/^CSS themes\/profiles: //p' | head -n 1)
+  [[ "$count" =~ ^[1-9][0-9]*$ ]]
+}
+
 plan_restore_path() {
-  local snapshot output plan_path plan_id approval_hash run_output details_output
+  local snapshot snapshot_details output plan_path plan_id approval_hash run_output details_output
   snapshot=$1
+  if (( $# >= 2 )); then
+    snapshot_details=$2
+  else
+    if ! snapshot_details=$("$CLI" snapshot inspect "$snapshot" 2>&1); then
+      show_error "$snapshot_details"
+      return
+    fi
+  fi
+  if snapshot_requires_decky "$snapshot_details" && ! ensure_decky_for_restore; then
+    return
+  fi
   if ! output=$("$CLI" restore plan "$snapshot" 2>&1); then
     if "$KDIALOG" --title "Restore plan unavailable" --warningyesno "Deck Snapshot could not create a safe restore plan. No production files were modified.\n\nView redacted technical details?"; then
       show_output "Restore plan details" "$output"
@@ -537,6 +659,7 @@ settings_dialog() {
 
 dashboard_summary() {
   local version latest latest_path latest_time latest_epoch latest_date today yesterday cloud stored decky plugin_count status_output list_output
+  local -a recovery_option=()
   version=$("$CLI" version 2>/dev/null | head -n 1)
   version=${version#Deck Snapshot }
   if [[ "$version" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-dev\. ]]; then
@@ -565,7 +688,7 @@ dashboard_summary() {
     fi
   fi
   plugin_count=0
-  if [[ -d "$HOME/homebrew/plugins" ]]; then
+  if decky_installed; then
     shopt -s nullglob
     for file in "$HOME/homebrew/plugins"/*; do
       [[ -d "$file" && ! -L "$file" ]] && plugin_count=$((plugin_count + 1))
@@ -573,7 +696,7 @@ dashboard_summary() {
     shopt -u nullglob
     decky="✓ $plugin_count plugins"
   else
-    decky="! Not detected"
+    decky="— Not installed"
   fi
   cloud="— Not connected"
   stored="— No backup yet"
@@ -581,12 +704,14 @@ dashboard_summary() {
     stored="✓ Local only"
   fi
   if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
-    if [[ -z "$RECOVERY_FILE" || ! -f "$RECOVERY_FILE" ]]; then
-      cloud="! Recovery file required"
-    elif status_output=$("$CLI" cloud status --recovery-file "$RECOVERY_FILE" 2>&1); then
+    recovery_option=()
+    if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+      recovery_option=(--recovery-file "$RECOVERY_FILE")
+    fi
+    if status_output=$("$CLI" cloud status "${recovery_option[@]}" 2>&1); then
       if printf '%s\n' "$status_output" | grep -Fx 'Cloud connected: true' >/dev/null; then
         cloud="✓ Connected"
-        if [[ "$latest" != "None" ]] && list_output=$("$CLI" cloud list --recovery-file "$RECOVERY_FILE" 2>/dev/null) \
+        if [[ "$latest" != "None" ]] && list_output=$("$CLI" cloud list "${recovery_option[@]}" 2>/dev/null) \
           && printf '%s\n' "$list_output" | grep -F "${latest}  " >/dev/null; then
           stored="✓ Local + Cloud"
         fi
@@ -601,11 +726,12 @@ dashboard_summary() {
       fi
     fi
   fi
-  printf '<table width="420" cellspacing="0" cellpadding="2"><tr><td align="left"><b>Deck Snapshot</b></td><td align="right">%s</td></tr><tr><td colspan="2">&nbsp;</td></tr><tr><td align="left">Google Drive</td><td align="right">%s</td></tr><tr><td align="left">Decky</td><td align="right">%s</td></tr><tr><td align="left">Last backup</td><td align="right">%s</td></tr><tr><td align="left">Stored</td><td align="right">%s</td></tr><tr><td colspan="2">&nbsp;</td></tr><tr><td align="left">Updates</td><td align="right">No automatic updates</td></tr></table>' "$version" "$cloud" "$decky" "$latest_time" "$stored"
+  printf '<table width="420" cellspacing="0" cellpadding="2"><tr><td align="left"><b>Deck Snapshot</b></td><td align="right">%s</td></tr><tr><td colspan="2">&nbsp;</td></tr><tr><td align="left">Google Drive</td><td align="right">%s</td></tr><tr><td align="left">Decky</td><td align="right">%s</td></tr><tr><td align="left">Last backup</td><td align="right">%s</td></tr><tr><td align="left">Stored</td><td align="right">%s</td></tr></table>' "$version" "$cloud" "$decky" "$latest_time" "$stored"
 }
 
 diagnostics() {
   local output cloud_output report steam decky google cloud_folder storage disk available_kb available_gib
+  local -a recovery_option=()
   if ! output=$("$CLI" doctor 2>&1); then
     if "$KDIALOG" --title "Diagnostics unavailable" --warningyesno "Diagnostics could not complete safely.\n\nView redacted technical details?"; then
       show_output "Diagnostics details" "$output"
@@ -627,8 +753,11 @@ diagnostics() {
     disk="✓ ${available_gib} GiB free"
   fi
   report=$output
-  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
-    if cloud_output=$("$CLI" cloud status --recovery-file "$RECOVERY_FILE" 2>&1); then
+  if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+    if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
+      recovery_option=(--recovery-file "$RECOVERY_FILE")
+    fi
+    if cloud_output=$("$CLI" cloud status "${recovery_option[@]}" 2>&1); then
       if printf '%s\n' "$cloud_output" | grep -Fx 'Cloud connected: true' >/dev/null; then
         google="✓ Connected"
       else
@@ -671,6 +800,7 @@ cloud_advanced_menu() {
     cloudlist "List protected cloud backups" \
     upload "Upload an existing local backup" \
     download "Download by exact backup name" \
+    import "Import recovery key" \
     unlock "Unlock a v0.1.0 cloud connection" \
     disconnect "Disconnect Google Drive locally" \
     back "Back") || return
@@ -678,6 +808,7 @@ cloud_advanced_menu() {
     cloudlist) cloud_command list ;;
     upload) upload_snapshot ;;
     download) download_snapshot ;;
+    import) import_recovery ;;
     unlock) unlock_legacy_cloud ;;
     disconnect) disconnect_cloud ;;
     back) return ;;
@@ -689,7 +820,7 @@ cloud_menu() {
   choice=$("$KDIALOG" --title "Google Drive" --menu "Google Drive options:" \
     connect "Connect or reconnect" \
     status "Check connection" \
-    recovery "Create recovery material" \
+    recovery "Export recovery key (Advanced)" \
     advanced "Advanced actions" \
     back "Back") || return
   case "$choice" in
@@ -722,10 +853,12 @@ more_menu() {
   choice=$("$KDIALOG" --title "More options" --menu "Choose a category:" \
     cloud "Google Drive" \
     application "Application" \
+    doctor "Diagnostics" \
     back "Back") || return
   case "$choice" in
     cloud) cloud_menu ;;
     application) application_menu ;;
+    doctor) diagnostics ;;
     back) return ;;
   esac
 }
@@ -737,7 +870,6 @@ while true; do
     restore "Restore" \
     snapshots "Snapshots" \
     settings "Settings" \
-    doctor "Diagnostics" \
     more "More options" \
     quit "Quit") || break
   case "$choice" in
@@ -745,7 +877,6 @@ while true; do
     restore) plan_restore ;;
     snapshots) snapshot_browser ;;
     settings) settings_dialog ;;
-    doctor) diagnostics ;;
     more) more_menu ;;
     quit) break ;;
   esac
