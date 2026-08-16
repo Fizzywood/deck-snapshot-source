@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-APP_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+APP_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLI="$APP_DIR/deck-snapshot"
 KDIALOG_BIN=${KDIALOG:-kdialog}
 RECOVERY_FILE=
 SELECTED_SNAPSHOT=
+SELECTED_SNAPSHOT_NAME=
 SELECTED_SNAPSHOT_LOCATION=
+SELECTED_SNAPSHOT_DETAILS=
+SELECTED_LOCAL=false
+SELECTED_CLOUD=false
+SELECTED_LEGACY=false
 UNINSTALLED=0
 QDBUS_BIN=
 PROGRESS_REF=()
 BACKUP_LOCK_FD=
 DECKY_URL="https://github.com/SteamDeckHomebrew/decky-loader"
+STARTUP_UPDATE_INSTALLED=
+STARTUP_UPDATE_AVAILABLE=
 
 if [[ ! -x "$CLI" ]]; then
   printf 'Deck Snapshot executable is missing: %s\n' "$CLI" >&2
@@ -372,13 +379,68 @@ create_snapshot() {
   fi
 }
 
+cloud_ready() {
+  [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]
+}
+
+legacy_cloud_ready() {
+  [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/config-password" ]]
+}
+
+legacy_cloud_detected() {
+  [[ -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/config-password" ]]
+}
+
+format_snapshot_epoch() {
+  local epoch=$1 today yesterday date_part
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { printf 'Unknown date'; return; }
+  date_part=$(date -d "@$epoch" '+%F' 2>/dev/null || true)
+  today=$(date '+%F' 2>/dev/null || true)
+  yesterday=$(date -d 'yesterday' '+%F' 2>/dev/null || true)
+  if [[ "$date_part" == "$today" ]]; then
+    date -d "@$epoch" '+Today · %H:%M'
+  elif [[ "$date_part" == "$yesterday" ]]; then
+    date -d "@$epoch" '+Yesterday · %H:%M'
+  else
+    date -d "@$epoch" '+%-d %b %Y · %H:%M'
+  fi
+}
+
+format_snapshot_name() {
+  local name=$1 timestamp epoch
+  if [[ "$name" =~ ^deck-snapshot-([0-9]{8}T[0-9]{6}Z)-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+    timestamp=${BASH_REMATCH[1]}
+    epoch=$(TZ=UTC date -d "${timestamp:0:4}-${timestamp:4:2}-${timestamp:6:2} ${timestamp:9:2}:${timestamp:11:2}:${timestamp:13:2}" '+%s' 2>/dev/null || true)
+    if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+      format_snapshot_epoch "$epoch"
+      return
+    fi
+  fi
+  printf 'Unknown date'
+}
+
+format_snapshot_created() {
+  local created=$1 epoch
+  epoch=$(date -d "$created" '+%s' 2>/dev/null || true)
+  if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+    format_snapshot_epoch "$epoch"
+  else
+    printf 'Unknown date'
+  fi
+}
+
 choose_snapshot() {
   local purpose=${1:-Snapshots}
-  local directory file key choice path output name local_mark cloud_mark legacy_mark label display_time location_label timestamp
+  local directory file key choice output name local_mark cloud_mark label display_time location_label
   local -a entries=() legacy_option=() recovery_option=() names=() sorted_names=()
   local -A local_seen=() cloud_seen=() legacy_seen=() all_seen=()
   SELECTED_SNAPSHOT=
+  SELECTED_SNAPSHOT_NAME=
   SELECTED_SNAPSHOT_LOCATION=
+  SELECTED_SNAPSHOT_DETAILS=
+  SELECTED_LOCAL=false
+  SELECTED_CLOUD=false
+  SELECTED_LEGACY=false
   directory="$HOME/.local/share/deck-snapshot/snapshots"
   shopt -s nullglob
   for file in "$directory"/*.tar.gz; do
@@ -387,7 +449,7 @@ choose_snapshot() {
     if [[ -z "${all_seen[$name]:-}" ]]; then names+=("$name"); all_seen["$name"]=1; fi
   done
   shopt -u nullglob
-  if [[ -f "$HOME/.config/deck-snapshot/cloud/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/config-password" ]]; then
+  if cloud_ready; then
     if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]]; then
       recovery_option=(--recovery-file "$RECOVERY_FILE")
     fi
@@ -400,7 +462,7 @@ choose_snapshot() {
       done <<<"$output"
     fi
   fi
-  if [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/rclone.conf" && -f "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/config-password" ]]; then
+  if legacy_cloud_ready; then
     if output=$("$CLI" cloud list --legacy --recovery-file "$RECOVERY_FILE" 2>/dev/null); then
       while IFS=' ' read -r name _; do
         if [[ "$name" =~ ^deck-snapshot-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
@@ -418,10 +480,8 @@ choose_snapshot() {
   for name in "${sorted_names[@]}"; do
     local_mark="—"
     cloud_mark="—"
-    legacy_mark="—"
     [[ -n "${local_seen[$name]:-}" ]] && local_mark="✓"
     [[ -n "${cloud_seen[$name]:-}" ]] && cloud_mark="✓"
-    [[ -n "${legacy_seen[$name]:-}" ]] && legacy_mark="✓"
     if [[ "$local_mark" == "✓" ]]; then
       key="local"
     elif [[ "$cloud_mark" == "✓" ]]; then
@@ -429,12 +489,7 @@ choose_snapshot() {
     else
       key="legacy"
     fi
-    label="$name — Local $local_mark · Google Drive $cloud_mark · Legacy $legacy_mark"
-    display_time=$name
-    if [[ "$name" =~ ^deck-snapshot-([0-9]{8}T[0-9]{6}Z)- ]]; then
-      timestamp=${BASH_REMATCH[1]}
-      display_time=$(date -u -d "${timestamp:0:8} ${timestamp:9:6}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || printf '%s' "$timestamp")
-    fi
+    display_time=$(format_snapshot_name "$name")
     location_label=
     [[ -n "${local_seen[$name]:-}" ]] && location_label="Local"
     [[ -n "${cloud_seen[$name]:-}" ]] && location_label+="${location_label:+ + }Google Drive"
@@ -449,6 +504,11 @@ choose_snapshot() {
   [[ -n "${local_seen[$name]:-}" ]] && location_label="Local"
   [[ -n "${cloud_seen[$name]:-}" ]] && location_label+="${location_label:+ + }Google Drive"
   [[ -n "${legacy_seen[$name]:-}" ]] && location_label+="${location_label:+ + }v0.1.0 cloud"
+  SELECTED_SNAPSHOT_NAME=$name
+  [[ -n "${local_seen[$name]:-}" ]] && SELECTED_LOCAL=true
+  [[ -n "${cloud_seen[$name]:-}" ]] && SELECTED_CLOUD=true
+  [[ -n "${legacy_seen[$name]:-}" ]] && SELECTED_LEGACY=true
+  SELECTED_SNAPSHOT_LOCATION=$location_label
   if [[ "$key" == "cloud" || "$key" == "legacy" ]]; then
     legacy_option=()
     if [[ "$key" == "legacy" ]]; then legacy_option=(--legacy); fi
@@ -457,51 +517,151 @@ choose_snapshot() {
     else
       recovery_option=()
     fi
-    if ! output=$("$CLI" cloud download "${legacy_option[@]}" "${recovery_option[@]}" "$name" 2>&1); then
-      if "$KDIALOG" --title "Snapshot download failed" --warningyesno "The cloud snapshot could not be downloaded and validated. No local snapshot was replaced.\n\nView redacted technical details?"; then
-        show_output "Snapshot download details" "$output"
+    if ! output=$("$CLI" cloud inspect --details "${legacy_option[@]}" "${recovery_option[@]}" "$name" 2>&1); then
+      if "$KDIALOG" --title "Snapshot blocked" --warningyesno "The cloud snapshot could not be downloaded and validated. No local snapshot was replaced.\n\nView redacted technical details?"; then
+        show_output "Snapshot inspection details" "$output"
       fi
       return
     fi
-    path=$(printf '%s\n' "$output" | sed -n 's/^Protected snapshot downloaded and validated: //p' | head -n 1)
+    SELECTED_SNAPSHOT_DETAILS=$output
   else
-    path="$directory/$name"
+    SELECTED_SNAPSHOT="$directory/$name"
   fi
-  if [[ -z "$path" || ! -f "$path" ]]; then
+  if [[ "$SELECTED_LOCAL" == true && ( -z "$SELECTED_SNAPSHOT" || ! -f "$SELECTED_SNAPSHOT" ) ]]; then
     show_error "The selected snapshot could not be prepared safely."
     return 1
   fi
-  SELECTED_SNAPSHOT=$path
-  SELECTED_SNAPSHOT_LOCATION=$location_label
+}
+
+snapshot_notice_label() {
+  local key=$1 code component
+  case "$1" in
+    orphan_plugin_state:decky) printf 'stale or unmatched Decky plugin-state folders were excluded' ;;
+    plugin_source_unresolved:decky) printf 'Decky plugins need official source verification before restore' ;;
+    secret_content_excluded:css-loader:translations) printf 'Large CSS Loader mapping cache was excluded for safety' ;;
+    secret_content_excluded:css-loader) printf 'Potentially sensitive CSS Loader content was excluded' ;;
+    shortcuts_vdf_not_captured:steam) printf 'Non-Steam shortcuts were not captured' ;;
+    symlink_excluded:steam) printf 'Linked Steam artwork aliases were not captured' ;;
+    unsupported_grid_file:steam:json) printf 'Steam artwork logo-position metadata files were excluded' ;;
+    unsupported_grid_file:steam:ico) printf 'Steam artwork icon files were excluded' ;;
+    *)
+      code=${key%%:*}
+      component=${key#*:}
+      component=${component%%:*}
+      printf '%s notice: %s' "$component" "${code//_/ }"
+      ;;
+  esac
+}
+
+group_snapshot_notices() {
+  local details=$1 code component message key label extension orphan_name
+  local -a lines=()
+  local -A counts=()
+  local -A orphan_names=()
+  while IFS=$'\t' read -r code component message; do
+    [[ "$code" =~ ^[a-z0-9_]+$ && "$component" =~ ^[a-z0-9_-]+$ && -n "$message" ]] || continue
+    if [[ "$code:$component" == orphan_plugin_state:decky ]]; then
+      orphan_name=${message##*: }
+      orphan_name=${orphan_name%.}
+      [[ "$orphan_name" =~ ^[A-Za-z0-9._-]+$ ]] && orphan_names["$orphan_name"]=1
+      continue
+    fi
+    key="$code:$component"
+    if [[ "$code:$component" == unsupported_grid_file:steam ]]; then
+      extension=${message##*.}
+      [[ "$extension" =~ ^[a-z0-9]+$ ]] && key="$key:$extension"
+    elif [[ "$code:$component" == secret_content_excluded:css-loader && "$message" == *css_translations.json ]]; then
+      key="$key:translations"
+    fi
+    counts["$key"]=$(( ${counts[$key]:-0} + 1 ))
+  done < <(printf '%s\n' "$details" | sed -n 's/^Notice: //p')
+  (( ${#counts[@]} > 0 || ${#orphan_names[@]} > 0 )) || return
+  if (( ${#orphan_names[@]} > 0 )); then
+    lines+=("• ${#orphan_names[@]} $(snapshot_notice_label orphan_plugin_state:decky)")
+  fi
+  for key in "${!counts[@]}"; do
+    label=$(snapshot_notice_label "$key")
+    lines+=("• ${counts[$key]} $label")
+  done
+  printf 'Notices\n%s\n\nArchive integrity is valid. Review the items above before relying on a complete restore.' "$(printf '%s\n' "${lines[@]}" | sort)"
+}
+
+snapshot_restore_coverage() {
+  local details=$1 code component message
+  while IFS=$'\t' read -r code component message; do
+    case "$code:$component" in
+      secret_content_excluded:css-loader|shortcuts_vdf_not_captured:steam|symlink_excluded:steam|unsupported_grid_file:steam)
+        printf 'Partial'
+        return
+        ;;
+    esac
+  done < <(printf '%s\n' "$details" | sed -n 's/^Notice: //p')
+}
+
+format_snapshot_size() {
+  local bytes=$1
+  [[ "$bytes" =~ ^[0-9]+$ ]] || { printf 'Unknown'; return; }
+  LC_ALL=C awk -v bytes="$bytes" 'BEGIN {
+    value = bytes
+    unit = 0
+    split("KB MB GB TB", units, " ")
+    while (value >= 1024 && unit < 4) {
+      value /= 1024
+      unit++
+    }
+    if (unit == 0) {
+      printf "%d bytes", bytes
+    } else {
+      printf "%.1f %s", value, units[unit]
+    }
+  }'
 }
 
 snapshot_summary_dialog() {
-  local details=$1 snapshot_id created plugins css_themes artwork warnings validation summary choice
-  snapshot_id=$(printf '%s\n' "$details" | sed -n 's/^Snapshot: //p' | head -n 1)
+  local details=$1 created plugins css_themes artwork warnings size size_bytes validation summary choice display_time notice_details coverage
   created=$(printf '%s\n' "$details" | sed -n 's/^Created: //p' | head -n 1)
   plugins=$(printf '%s\n' "$details" | sed -n 's/^Plugins: //p' | head -n 1)
   css_themes=$(printf '%s\n' "$details" | sed -n 's/^CSS themes\/profiles: //p' | head -n 1)
   artwork=$(printf '%s\n' "$details" | sed -n 's/^Artwork: //p' | head -n 1)
   warnings=$(printf '%s\n' "$details" | sed -n 's/^Warnings: //p' | head -n 1)
-  [[ -n "$snapshot_id" ]] || snapshot_id="Unknown"
   [[ -n "$created" ]] || created="Unknown"
   [[ -n "$plugins" ]] || plugins="Unknown"
   [[ -n "$css_themes" ]] || css_themes="Unknown"
   [[ -n "$artwork" ]] || artwork="Unknown"
   [[ -n "$warnings" ]] || warnings="Unknown"
-  validation="Valid"
-  if [[ "$warnings" =~ ^[0-9]+$ && "$warnings" != 0 ]]; then
-    validation="Valid with $warnings warnings"
-  fi
-  summary=$(printf 'Backup: %s\nBackup date/time: %s\nValidation: %s\nDecky plugins: %s\nCSS Loader themes/profiles: %s\nSteam artwork: %s\nStorage: %s' \
-    "$snapshot_id" "$created" "$validation" "$plugins" "$css_themes" "$artwork" \
-    "${SELECTED_SNAPSHOT_LOCATION:-Unknown}")
-  choice=$("$KDIALOG" --title "Snapshot details" --menu "$summary" \
-    restore "Restore this backup" \
-    close "Close") || return
-  if [[ "$choice" == restore ]]; then
-    plan_restore_path "$SELECTED_SNAPSHOT" "$details"
-  fi
+  validation="✓ Valid"
+  size_bytes=$(printf '%s\n' "$details" | sed -n 's/^Size: \([0-9][0-9]*\) bytes$/\1/p' | head -n 1)
+  size=
+  [[ -n "$size_bytes" ]] && size=$(format_snapshot_size "$size_bytes")
+  display_time=$(format_snapshot_created "$created")
+  notice_details=$(group_snapshot_notices "$details")
+  coverage=$(snapshot_restore_coverage "$details")
+  summary=$(printf 'Backup date/time: %s\nValidation: %s\nStorage: %s\nDecky plugins: %s\nCSS Loader themes/profiles: %s\nSteam artwork: %s%s%s%s' \
+    "$display_time" "$validation" "${SELECTED_SNAPSHOT_LOCATION:-Unknown}" "$plugins" "$css_themes" "$artwork" \
+    "${size:+\nBackup size: $size}" \
+    "${coverage:+\nRestore coverage: $coverage}" \
+    "${notice_details:+\nNotices: $warnings}")
+  local -a actions=(restore "Restore this backup")
+  [[ -n "$notice_details" ]] && actions+=(notices "View details")
+  if [[ "$SELECTED_LOCAL" == true && "$SELECTED_CLOUD" == false ]] && cloud_ready; then actions+=(upload "Upload to Google Drive"); fi
+  if [[ "$SELECTED_LOCAL" == true || ( "$SELECTED_CLOUD" == true && "$SELECTED_LEGACY" == false ) ]]; then actions+=(delete "Delete backup…"); fi
+  actions+=(close "Close")
+  choice=$("$KDIALOG" --title "Snapshot details" --menu "$summary" "${actions[@]}") || return
+  case "$choice" in
+    restore) restore_selected_snapshot "$details" ;;
+    notices)
+      show_output "Snapshot notices" "$notice_details"
+      snapshot_summary_dialog "$details"
+      ;;
+    upload)
+      if cloud_command upload "$SELECTED_SNAPSHOT"; then
+        SELECTED_CLOUD=true
+        SELECTED_SNAPSHOT_LOCATION="Local + Google Drive"
+        snapshot_summary_dialog "$details"
+      fi
+      ;;
+    delete) delete_selected_snapshot ;;
+  esac
 }
 
 snapshot_browser() {
@@ -509,37 +669,57 @@ snapshot_browser() {
   if ! choose_snapshot "Snapshots"; then
     return
   fi
-  if ! output=$("$CLI" snapshot inspect "$SELECTED_SNAPSHOT" 2>&1); then
-    show_error "$output"
+  if [[ -n "$SELECTED_SNAPSHOT_DETAILS" ]]; then
+    output=$SELECTED_SNAPSHOT_DETAILS
+  elif ! output=$("$CLI" snapshot inspect --details "$SELECTED_SNAPSHOT" 2>&1); then
+    show_error "Snapshot blocked\n\nThis backup could not be validated safely.\n\n$output"
     return
   fi
   snapshot_summary_dialog "$output"
 }
 
-list_local() {
-  local output
-  if output=$("$CLI" snapshot list 2>&1); then
-    show_output "Local snapshots" "$output"
-  else
-    show_error "$output"
-  fi
-}
-
-upload_snapshot() {
-  local path
-  if [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/deck-snapshot/cloud/recovery.json" ]] && ! ensure_recovery_file; then
+restore_selected_snapshot() {
+  local details=$1 output path
+  if [[ "$SELECTED_LOCAL" == true ]]; then
+    plan_restore_path "$SELECTED_SNAPSHOT" "$details"
     return
   fi
-  path=$("$KDIALOG" --title "Upload protected snapshot" --getopenfilename "$HOME/.local/share/deck-snapshot/snapshots" '*.tar.gz|Deck Snapshot archives') || return
-  [[ -n "$path" ]] || return
-  cloud_command upload "$path"
+  local -a options=()
+  [[ "$SELECTED_LEGACY" == true ]] && options+=(--legacy)
+  [[ -n "$RECOVERY_FILE" && -f "$RECOVERY_FILE" ]] && options+=(--recovery-file "$RECOVERY_FILE")
+  if ! output=$("$CLI" cloud download "${options[@]}" "$SELECTED_SNAPSHOT_NAME" 2>&1); then
+    show_error "$output"
+    return
+  fi
+  path=$(printf '%s\n' "$output" | sed -n 's/^Protected snapshot downloaded and validated: //p' | head -n 1)
+  if [[ -z "$path" || ! -f "$path" ]]; then show_error "The selected snapshot could not be downloaded safely."; return; fi
+  SELECTED_SNAPSHOT=$path
+  SELECTED_LOCAL=true
+  plan_restore_path "$path" "$details"
 }
 
-download_snapshot() {
-  local name
-  name=$("$KDIALOG" --title "Download protected snapshot" --inputbox "Enter the exact cloud snapshot name. Use 'List cloud snapshots' first.") || return
-  [[ -n "$name" ]] || return
-  cloud_command download "$name"
+delete_selected_snapshot() {
+  local choice output
+  if [[ "$SELECTED_LOCAL" == true && "$SELECTED_CLOUD" == true && "$SELECTED_LEGACY" == false ]]; then
+    choice=$("$KDIALOG" --title "Delete backup" --menu "Choose exactly what to remove. Google Drive removal moves only this backup to Trash." \
+      local "Delete local copy" cloud "Move Google Drive copy to Trash" both "Delete both" cancel "Cancel") || return
+  elif [[ "$SELECTED_LOCAL" == true ]]; then
+    choice=$("$KDIALOG" --title "Delete local copy" --menu "Local deletion is permanent." local "Delete local copy" cancel "Cancel") || return
+  else
+    choice=$("$KDIALOG" --title "Move Google Drive copy to Trash" --menu "Only this backup will be moved to Google Drive Trash." cloud "Move Google Drive copy to Trash" cancel "Cancel") || return
+  fi
+  [[ "$choice" != cancel ]] || return
+  if ! "$KDIALOG" --title "Confirm backup removal" --warningyesno "Remove the exact selected backup? This action cannot affect any other backup, recovery key, or configuration."; then return; fi
+  if [[ "$choice" == cloud || "$choice" == both ]]; then
+    if ! cloud_command trash "$SELECTED_SNAPSHOT_NAME"; then return; fi
+  fi
+  if [[ "$choice" == local || "$choice" == both ]]; then
+    if output=$("$CLI" snapshot delete "$SELECTED_SNAPSHOT_NAME" 2>&1); then
+      show_output "Backup deleted" "$output"
+    else
+      show_error "$output"
+    fi
+  fi
 }
 
 decky_installed() {
@@ -629,13 +809,6 @@ plan_restore_path() {
   fi
 }
 
-plan_restore() {
-  if ! choose_snapshot "Restore"; then
-    return
-  fi
-  plan_restore_path "$SELECTED_SNAPSHOT"
-}
-
 settings_dialog() {
   local output auto current
   output=$("$CLI" settings show 2>&1) || { show_error "$output"; return; }
@@ -658,7 +831,7 @@ settings_dialog() {
 }
 
 dashboard_summary() {
-  local version latest latest_path latest_time latest_epoch latest_date today yesterday cloud stored decky plugin_count status_output list_output
+  local version latest latest_path latest_time cloud stored decky plugin_count status_output list_output
   local -a recovery_option=()
   version=$("$CLI" version 2>/dev/null | head -n 1)
   version=${version#Deck Snapshot }
@@ -675,17 +848,7 @@ dashboard_summary() {
   shopt -u nullglob
   latest_time="No backup yet"
   if [[ -n "$latest_path" ]]; then
-    latest_epoch=$(stat -c '%Y' "$latest_path" 2>/dev/null || true)
-    latest_date=$(date -d "@$latest_epoch" '+%Y-%m-%d' 2>/dev/null || true)
-    today=$(date '+%Y-%m-%d')
-    yesterday=$(date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null || true)
-    if [[ "$latest_date" == "$today" ]]; then
-      latest_time=$(date -d "@$latest_epoch" '+Today · %H:%M' 2>/dev/null || printf '%s' "$latest")
-    elif [[ "$latest_date" == "$yesterday" ]]; then
-      latest_time=$(date -d "@$latest_epoch" '+Yesterday · %H:%M' 2>/dev/null || printf '%s' "$latest")
-    else
-      latest_time=$(date -d "@$latest_epoch" '+%Y-%m-%d · %H:%M' 2>/dev/null || printf '%s' "$latest")
-    fi
+    latest_time=$(format_snapshot_name "$latest")
   fi
   plugin_count=0
   if decky_installed; then
@@ -796,18 +959,12 @@ uninstall_application() {
 
 cloud_advanced_menu() {
   local choice
-  choice=$("$KDIALOG" --title "Google Drive — Advanced" --menu "Advanced cloud actions:" \
-    cloudlist "List protected cloud backups" \
-    upload "Upload an existing local backup" \
-    download "Download by exact backup name" \
-    import "Import recovery key" \
-    unlock "Unlock a v0.1.0 cloud connection" \
-    disconnect "Disconnect Google Drive locally" \
-    back "Back") || return
+  local -a actions=(export "Export recovery key" import "Import recovery key")
+  if legacy_cloud_detected; then actions+=(unlock "Legacy v0.1.0 recovery"); fi
+  actions+=(disconnect "Disconnect Google Drive" back "Back")
+  choice=$("$KDIALOG" --title "Google Drive — Advanced" --menu "Advanced Google Drive actions:" "${actions[@]}") || return
   case "$choice" in
-    cloudlist) cloud_command list ;;
-    upload) upload_snapshot ;;
-    download) download_snapshot ;;
+    export) create_recovery ;;
     import) import_recovery ;;
     unlock) unlock_legacy_cloud ;;
     disconnect) disconnect_cloud ;;
@@ -820,13 +977,11 @@ cloud_menu() {
   choice=$("$KDIALOG" --title "Google Drive" --menu "Google Drive options:" \
     connect "Connect or reconnect" \
     status "Check connection" \
-    recovery "Export recovery key (Advanced)" \
-    advanced "Advanced actions" \
+    advanced "Advanced" \
     back "Back") || return
   case "$choice" in
     connect) connect_or_reconnect_cloud ;;
     status) cloud_command status ;;
-    recovery) create_recovery ;;
     advanced) cloud_advanced_menu ;;
     back) return ;;
   esac
@@ -835,27 +990,90 @@ cloud_menu() {
 application_menu() {
   local choice version
   choice=$("$KDIALOG" --title "Deck Snapshot" --menu "Application options:" \
-    about "About and updates" \
+    about "About & Updates" \
     uninstall "Uninstall Deck Snapshot" \
     back "Back") || return
   case "$choice" in
-    about)
-      version=$("$CLI" version 2>/dev/null | head -n 1)
-      show_output "About Deck Snapshot" "$version\n\nDeck Snapshot does not download or install updates automatically. To update, download the newest installer from the verified public release page and open it. Your backups and settings are kept."
-      ;;
+    about) about_updates ;;
     uninstall) uninstall_application ;;
     back) return ;;
   esac
 }
 
-more_menu() {
+about_updates() {
+  local version output installed available up_to_date
+  version=$("$CLI" version 2>/dev/null | head -n 1)
+  if ! output=$("$CLI" update check 2>&1); then
+    show_output "About & Updates" "$version\n\nUpdate check unavailable\n\nDeck Snapshot continues to work normally."
+    return
+  fi
+  installed=$(printf '%s\n' "$output" | sed -n 's/^Installed: //p' | head -n 1)
+  available=$(printf '%s\n' "$output" | sed -n 's/^Available: //p' | head -n 1)
+  up_to_date=$(printf '%s\n' "$output" | sed -n 's/^Up to date: //p' | head -n 1)
+  if [[ "$up_to_date" == true ]]; then
+    show_output "About & Updates" "$version\n\nInstalled: $installed\n\nUp to date"
+    return
+  fi
+  if ! version_is_newer "$available" "$installed"; then
+    show_output "About & Updates" "$version\n\nUpdate check unavailable"
+    return
+  fi
+  confirm_update "$installed" "$available"
+}
+
+version_is_newer() {
+  local available=$1 installed=$2 available_parts installed_parts index
+  [[ "$available" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$installed" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r -a available_parts <<<"${available#v}"
+  IFS=. read -r -a installed_parts <<<"${installed#v}"
+  for index in 0 1 2; do
+    if (( 10#${available_parts[index]} > 10#${installed_parts[index]} )); then
+      return 0
+    fi
+    if (( 10#${available_parts[index]} < 10#${installed_parts[index]} )); then
+      return 1
+    fi
+  done
+  return 1
+}
+
+startup_update_check() {
+  local output installed available up_to_date
+  STARTUP_UPDATE_INSTALLED=
+  STARTUP_UPDATE_AVAILABLE=
+  if ! output=$("$CLI" update check 2>/dev/null); then
+    return
+  fi
+  installed=$(printf '%s\n' "$output" | sed -n 's/^Installed: //p' | head -n 1)
+  available=$(printf '%s\n' "$output" | sed -n 's/^Available: //p' | head -n 1)
+  up_to_date=$(printf '%s\n' "$output" | sed -n 's/^Up to date: //p' | head -n 1)
+  if [[ "$up_to_date" == false ]] && version_is_newer "$available" "$installed"; then
+    STARTUP_UPDATE_INSTALLED=$installed
+    STARTUP_UPDATE_AVAILABLE=$available
+  fi
+}
+
+confirm_update() {
+  local installed=$1 available=$2 choice output
+  choice=$("$KDIALOG" --title "Deck Snapshot Update" --menu "Installed: $installed\nAvailable: $available" update "Update now" later "Not now") || return
+  [[ "$choice" == update ]] || return
+  if output=$("$CLI" update install 2>&1); then
+    show_output "Update installed" "Deck Snapshot $available was installed successfully.\n\nClose and reopen Deck Snapshot to use the new version."
+  else
+    show_error "Update failed safely. Your current Deck Snapshot installation remains available."
+  fi
+}
+
+settings_tools_menu() {
   local choice
-  choice=$("$KDIALOG" --title "More options" --menu "Choose a category:" \
+  choice=$("$KDIALOG" --title "Settings & tools" --menu "Choose a category:" \
+    backup "Backup settings" \
     cloud "Google Drive" \
     application "Application" \
     doctor "Diagnostics" \
     back "Back") || return
   case "$choice" in
+    backup) settings_dialog ;;
     cloud) cloud_menu ;;
     application) application_menu ;;
     doctor) diagnostics ;;
@@ -863,24 +1081,31 @@ more_menu() {
   esac
 }
 
-while true; do
-  summary=$(dashboard_summary)
-  choice=$("$KDIALOG" --title "Deck Snapshot" --menu "$summary<br><br><b>What would you like to do?</b>" \
-    create "Create Backup" \
-    restore "Restore" \
-    snapshots "Snapshots" \
-    settings "Settings" \
-    more "More options" \
-    quit "Quit") || break
-  case "$choice" in
-    create) create_snapshot ;;
-    restore) plan_restore ;;
-    snapshots) snapshot_browser ;;
-    settings) settings_dialog ;;
-    more) more_menu ;;
-    quit) break ;;
-  esac
-  if (( UNINSTALLED == 1 )); then
-    break
-  fi
-done
+main() {
+  local choice summary
+  local -a actions
+  startup_update_check
+  while true; do
+    summary=$(dashboard_summary)
+    actions=(create "Create Backup" snapshots "Snapshots")
+    if [[ -n "$STARTUP_UPDATE_AVAILABLE" ]]; then
+      actions+=(update "Update to $STARTUP_UPDATE_AVAILABLE")
+    fi
+    actions+=(tools "Settings & tools" quit "Quit")
+    choice=$("$KDIALOG" --title "Deck Snapshot" --menu "$summary<br><br><b>What would you like to do?</b>" "${actions[@]}") || break
+    case "$choice" in
+      create) create_snapshot ;;
+      snapshots) snapshot_browser ;;
+      update) confirm_update "$STARTUP_UPDATE_INSTALLED" "$STARTUP_UPDATE_AVAILABLE" ;;
+      tools) settings_tools_menu ;;
+      quit) break ;;
+    esac
+    if (( UNINSTALLED == 1 )); then
+      break
+    fi
+  done
+}
+
+if [[ "${DECK_SNAPSHOT_UI_LIBRARY:-}" != 1 ]]; then
+  main "$@"
+fi

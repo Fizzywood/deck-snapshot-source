@@ -40,6 +40,18 @@ func TestVersionIsEnglish(t *testing.T) {
 	}
 }
 
+func TestSnapshotDetailsEmitNoticesOnlyOnRequest(t *testing.T) {
+	response := snapshotDetailsResponse{CreatedUTC: "2026-08-16T12:00:00Z", Size: 42, Files: 1, FileBytes: 42, Warnings: []manifest.Warning{{Code: "unsupported_grid_file", Component: "steam", Message: "A non-image grid file was excluded."}}}
+	var stdout, stderr bytes.Buffer
+	if code := writeSnapshotDetails(&stdout, &stderr, false, false, response); code != ExitOK || strings.Contains(stdout.String(), "Notice:") {
+		t.Fatalf("concise details = code %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	if code := writeSnapshotDetails(&stdout, &stderr, false, true, response); code != ExitOK || !strings.Contains(stdout.String(), "Notice: unsupported_grid_file\tsteam\tA non-image grid file was excluded.\n") {
+		t.Fatalf("detailed details = code %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestPathsJSON(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "person")
 	var stdout, stderr bytes.Buffer

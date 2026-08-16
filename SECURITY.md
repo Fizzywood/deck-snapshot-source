@@ -53,6 +53,8 @@ Treat snapshot archives, manifests, plugin metadata, cloud listings, downloaded 
 - Any deletion must target an explicit, canonical path beneath a narrow allowlisted root and must be justified by the restore plan.
 - Do not invoke recursive deletion tools with dynamic, unresolved, empty, home, root or workspace-wide targets.
 - Never build destructive shell commands from snapshot, plugin or cloud metadata.
+- User snapshot deletion accepts only one validated regular archive name beneath the canonical snapshot root; it rejects links, paths, wildcards, recovery artifacts, reports, and configuration.
+- A normal Google Drive snapshot deletion uses only rclone's exact single-file `deletefile` operation with the provider Trash enabled, then verifies that exact name is absent from the active listing. It never uses permanent-delete flags, cleanup, wildcards, directory deletion, or legacy app-folder deletion.
 
 ## External processes
 
@@ -69,6 +71,7 @@ Treat snapshot archives, manifests, plugin metadata, cloud listings, downloaded 
 - Download to a private temporary file, enforce size/time limits, verify before rename or execution, and fail closed on mismatch.
 - Never silently substitute a package/version. Report the requested identity/version and the explicit alternative.
 - The Decky installer adapter may use only the current official installation flow. Elevation must be isolated to the required official step and never granted to Deck Snapshot generally.
+- The user-initiated updater accepts only the fixed public Deck Snapshot stable manifest and its exact GitHub release asset paths. It performs at most one bounded foreground check when the desktop UI opens, plus explicit manual checks, and never runs a daemon, scheduled poll, or background installation. It bounds network time and bytes, rejects redirects outside the approved GitHub release infrastructure, validates schema/version/asset identity/size/SHA-256, downloads to a private temporary file, and starts the existing installer path only after verification.
 
 ## OAuth, rclone and cloud encryption
 

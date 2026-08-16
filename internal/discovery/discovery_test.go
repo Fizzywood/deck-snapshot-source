@@ -87,6 +87,54 @@ func TestDiscoverExcludesSecretContentAndSymlink(t *testing.T) {
 	}
 }
 
+func TestDiscoverCapturesAllowlistedSteamArtworkSidecars(t *testing.T) {
+	root := t.TempDir()
+	grid := filepath.Join(root, ".local", "share", "Steam", "userdata", "100000001", "config", "grid")
+	if err := os.MkdirAll(grid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(grid, "900000001.json"), `{"nVersion":1,"logoPosition":{"nHeightPct":50,"nWidthPct":75.5,"pinnedPosition":"BottomCenter"}}`)
+	mustWriteBytes(t, filepath.Join(grid, "900000001_icon.ico"), []byte{0, 0, 1, 0, 1, 0, 16, 16})
+	mustWriteBytes(t, filepath.Join(grid, "900000002_icon.ico"), []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	oversizedIcon := make([]byte, maxGridIconSize+1)
+	copy(oversizedIcon, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	mustWriteBytes(t, filepath.Join(grid, "900000009_icon.ico"), oversizedIcon)
+	mustWrite(t, filepath.Join(grid, "900000002.json"), `{"nVersion":2,"logoPosition":{"nHeightPct":50,"nWidthPct":75,"pinnedPosition":"BottomCenter"}}`)
+	mustWriteBytes(t, filepath.Join(grid, "900000003_icon.ico"), []byte("not-an-icon"))
+	mustWrite(t, filepath.Join(grid, "900000004.json"), `{"nVersion":1,"logoPosition":{"nHeightPct":50,"nWidthPct":75,"pinnedPosition":"BottomCenter"},"extra":true}`)
+	mustWrite(t, filepath.Join(grid, "not-an-artwork.json"), `{"nVersion":1}`)
+
+	options := fixtureOptions(root)
+	options.Paths.Decky = filepath.Join(root, "missing-decky")
+	result, err := Discover(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, logical := range []string{
+		"steam/artwork/userdata/100000001/grid/900000001.json",
+		"steam/artwork/userdata/100000001/grid/900000001_icon.ico",
+		"steam/artwork/userdata/100000001/grid/900000002_icon.ico",
+	} {
+		if !hasFile(result, logical) {
+			t.Fatalf("allowlisted artwork sidecar was omitted: %s", logical)
+		}
+	}
+	for _, logical := range []string{
+		"steam/artwork/userdata/100000001/grid/900000002.json",
+		"steam/artwork/userdata/100000001/grid/900000003_icon.ico",
+		"steam/artwork/userdata/100000001/grid/900000004.json",
+		"steam/artwork/userdata/100000001/grid/900000009_icon.ico",
+		"steam/artwork/userdata/100000001/grid/not-an-artwork.json",
+	} {
+		if hasFile(result, logical) || !hasExclusion(result, logical, "unsupported_grid_file") {
+			t.Fatalf("unsupported artwork sidecar was accepted: %s", logical)
+		}
+	}
+	if artworkType(result, "steam/artwork/userdata/100000001/grid/900000001.json") != "logo-position" || artworkType(result, "steam/artwork/userdata/100000001/grid/900000001_icon.ico") != "icon" {
+		t.Fatalf("unexpected artwork sidecar types: %#v", result.Manifest.Artwork)
+	}
+}
+
 func TestDiscoverRecordsOversizedExclusion(t *testing.T) {
 	root := t.TempDir()
 	decky := filepath.Join(root, "homebrew")
@@ -176,9 +224,25 @@ func hasExclusion(result Result, logicalPath, reason string) bool {
 	return false
 }
 
+func artworkType(result Result, logicalPath string) string {
+	for _, artwork := range result.Manifest.Artwork {
+		if artwork.LogicalPath == logicalPath {
+			return artwork.Type
+		}
+	}
+	return ""
+}
+
 func mustWrite(t *testing.T, path, value string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustWriteBytes(t *testing.T, path string, value []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, value, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

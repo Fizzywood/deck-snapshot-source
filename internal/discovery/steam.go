@@ -1,9 +1,12 @@
 package discovery
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,8 +19,24 @@ import (
 var (
 	numericNamePattern = regexp.MustCompile(`^[0-9]+$`)
 	gridNamePattern    = regexp.MustCompile(`^([0-9]+)(p|_hero|_logo|_icon)?\.(png|jpg|jpeg)$`)
+	gridLogoPattern    = regexp.MustCompile(`^([0-9]+)\.json$`)
+	gridIconPattern    = regexp.MustCompile(`^([0-9]+)_icon\.ico$`)
 	libraryIconPattern = regexp.MustCompile(`^([0-9]+)_icon\.(png|jpg|jpeg)$`)
 )
+
+const (
+	maxGridLogoMetadataSize = 4 << 10
+	maxGridIconSize         = 1 << 20
+)
+
+type gridLogoMetadata struct {
+	NVersion     *int `json:"nVersion"`
+	LogoPosition *struct {
+		Height *float64 `json:"nHeightPct"`
+		Width  *float64 `json:"nWidthPct"`
+		Pinned *string  `json:"pinnedPosition"`
+	} `json:"logoPosition"`
+}
 
 func (b *builder) discoverSteam(steamRoot string) error {
 	userdataRoot := filepath.Join(steamRoot, "userdata")
@@ -71,8 +90,22 @@ func (b *builder) discoverGrid(accountID, gridRoot string) error {
 		extension := strings.ToLower(filepath.Ext(name))
 		if extension != ".png" && extension != ".jpg" && extension != ".jpeg" {
 			logical := path.Join("steam/artwork/userdata", accountID, "grid", name)
+			if appID, artworkType, supported := supportedGridSidecar(name, filepath.Join(gridRoot, name)); supported {
+				fileEntry, included, err := b.addSource(filepath.Join(gridRoot, name), logical, "steam")
+				if err != nil {
+					return err
+				}
+				if !included {
+					continue
+				}
+				if err := verifyGridSidecar(filepath.Join(gridRoot, name), fileEntry.SHA256); err != nil {
+					return fmt.Errorf("verify Steam artwork sidecar %s: %w", logical, err)
+				}
+				b.manifest.Artwork = append(b.manifest.Artwork, manifest.Artwork{AccountID: accountID, AppID: appID, Type: artworkType, LogicalPath: logical, SHA256: fileEntry.SHA256})
+				continue
+			}
 			b.exclude(logical, "steam", "unsupported_grid_file")
-			b.warn("unsupported_grid_file", "steam", "A non-image Steam grid file was not captured because its current semantics are unverified: "+logical)
+			b.warn("unsupported_grid_file", "steam", "A Steam grid file was not captured because it does not match the allowlisted artwork metadata or icon formats: "+logical)
 			continue
 		}
 		logical := path.Join("steam/artwork/userdata", accountID, "grid", name)
@@ -96,6 +129,91 @@ func (b *builder) discoverGrid(accountID, gridRoot string) error {
 		})
 	}
 	return nil
+}
+
+func supportedGridSidecar(name, sourcePath string) (string, string, bool) {
+	if matches := gridLogoPattern.FindStringSubmatch(strings.ToLower(name)); len(matches) == 2 {
+		return matches[1], "logo-position", validGridLogoMetadata(sourcePath)
+	}
+	if matches := gridIconPattern.FindStringSubmatch(strings.ToLower(name)); len(matches) == 2 {
+		return matches[1], "icon", validGridIcon(sourcePath)
+	}
+	return "", "", false
+}
+
+func verifyGridSidecar(sourcePath, expectedSHA256 string) error {
+	info, err := os.Lstat(sourcePath)
+	if err != nil {
+		return err
+	}
+	hash, _, err := hashRegularFile(sourcePath, info)
+	if err != nil {
+		return err
+	}
+	if hash != expectedSHA256 {
+		return errors.New("sidecar changed after validation")
+	}
+	if gridLogoPattern.MatchString(strings.ToLower(filepath.Base(sourcePath))) {
+		if !validGridLogoMetadata(sourcePath) {
+			return errors.New("logo metadata no longer matches the allowlist")
+		}
+		return nil
+	}
+	if gridIconPattern.MatchString(strings.ToLower(filepath.Base(sourcePath))) {
+		if !validGridIcon(sourcePath) {
+			return errors.New("icon no longer matches the allowlist")
+		}
+		return nil
+	}
+	return errors.New("unsupported artwork sidecar name")
+}
+
+func validGridLogoMetadata(sourcePath string) bool {
+	info, err := os.Lstat(sourcePath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxGridLogoMetadataSize {
+		return false
+	}
+	file, err := os.Open(sourcePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(io.LimitReader(file, maxGridLogoMetadataSize+1))
+	decoder.DisallowUnknownFields()
+	var metadata gridLogoMetadata
+	if err := decoder.Decode(&metadata); err != nil {
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return false
+	}
+	if metadata.NVersion == nil || *metadata.NVersion != 1 || metadata.LogoPosition == nil || metadata.LogoPosition.Height == nil || metadata.LogoPosition.Width == nil || metadata.LogoPosition.Pinned == nil || math.IsNaN(*metadata.LogoPosition.Height) || math.IsInf(*metadata.LogoPosition.Height, 0) || math.IsNaN(*metadata.LogoPosition.Width) || math.IsInf(*metadata.LogoPosition.Width, 0) || *metadata.LogoPosition.Height < 0 || *metadata.LogoPosition.Height > 100 || *metadata.LogoPosition.Width < 0 || *metadata.LogoPosition.Width > 100 {
+		return false
+	}
+	switch *metadata.LogoPosition.Pinned {
+	case "UpperLeft", "UpperCenter", "UpperRight", "CenterLeft", "CenterCenter", "CenterRight", "BottomLeft", "BottomCenter", "BottomRight":
+		return true
+	default:
+		return false
+	}
+}
+
+func validGridIcon(sourcePath string) bool {
+	info, err := os.Lstat(sourcePath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 8 || info.Size() > maxGridIconSize {
+		return false
+	}
+	file, err := os.Open(sourcePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	var header [8]byte
+	if _, err := io.ReadFull(file, header[:]); err != nil {
+		return false
+	}
+	return bytes.Equal(header[:], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) || bytes.Equal(header[:4], []byte{0, 0, 1, 0})
 }
 
 func (b *builder) discoverLibraryIcons(root string) error {

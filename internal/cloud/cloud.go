@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Fizzywood/deck-snapshot/internal/limits"
+	"github.com/Fizzywood/deck-snapshot/internal/manifest"
 	"github.com/Fizzywood/deck-snapshot/internal/snapshot"
 )
 
@@ -242,6 +243,72 @@ func (manager Manager) Download(ctx context.Context, name string) (string, error
 		return "", fmt.Errorf("publish validated cloud download: %w", err)
 	}
 	return finalPath, nil
+}
+
+// Inspect downloads one exact protected snapshot to a private temporary file,
+// validates it fully, and never publishes it into the normal snapshot root.
+// It exists for cloud-only snapshot browsing; callers receive only validated
+// metadata and no persistent local copy is created.
+func (manager Manager) Inspect(ctx context.Context, name string) (manifest.Manifest, Item, error) {
+	if err := manager.preflight(ctx); err != nil {
+		return manifest.Manifest{}, Item{}, err
+	}
+	if !validSnapshotName(name) {
+		return manifest.Manifest{}, Item{}, errors.New("cloud snapshot name is unsafe")
+	}
+	temporaryDirectory, err := os.MkdirTemp("", "deck-snapshot-cloud-inspect-")
+	if err != nil {
+		return manifest.Manifest{}, Item{}, err
+	}
+	defer os.RemoveAll(temporaryDirectory)
+	temporaryPath := filepath.Join(temporaryDirectory, name)
+	if _, err := manager.run(ctx, "copyto", manager.remotePath(name), temporaryPath, "--immutable"); err != nil {
+		return manifest.Manifest{}, Item{}, fmt.Errorf("download protected snapshot for inspection: %w", err)
+	}
+	if err := os.Chmod(temporaryPath, 0o600); err != nil {
+		return manifest.Manifest{}, Item{}, err
+	}
+	value, err := snapshot.ValidateContext(ctx, temporaryPath, manager.Limits)
+	if err != nil {
+		return manifest.Manifest{}, Item{}, fmt.Errorf("validate protected snapshot for inspection: %w", err)
+	}
+	if expectedSnapshotName(value.CreatedUTC, value.SnapshotID) != name {
+		return manifest.Manifest{}, Item{}, errors.New("downloaded snapshot manifest does not match its cloud name")
+	}
+	info, err := os.Stat(temporaryPath)
+	if err != nil {
+		return manifest.Manifest{}, Item{}, err
+	}
+	return value, Item{Name: name, Size: info.Size()}, nil
+}
+
+// Trash moves one exact visible-folder protected snapshot to the provider's
+// Trash. It deliberately never accepts legacy remotes, wildcards, directory
+// operations, or permanent-delete flags.
+func (manager Manager) Trash(ctx context.Context, name string) error {
+	profile, err := manager.preflightProfile(ctx)
+	if err != nil {
+		return err
+	}
+	if profile.legacy {
+		return errors.New("legacy v0.1.0 cloud snapshots are read-only and cannot be moved to Trash")
+	}
+	if !validSnapshotName(name) {
+		return errors.New("cloud snapshot name is unsafe")
+	}
+	if _, err := manager.run(ctx, "deletefile", manager.remotePath(name)); err != nil {
+		return fmt.Errorf("move protected snapshot to Google Drive Trash: %w", err)
+	}
+	items, err := manager.listRemote(ctx)
+	if err != nil {
+		return fmt.Errorf("verify protected snapshot Trash operation: %w", err)
+	}
+	for _, item := range items {
+		if item.Name == name {
+			return errors.New("protected snapshot still appears in the active Google Drive listing after Trash operation")
+		}
+	}
+	return nil
 }
 
 func (manager Manager) preflight(ctx context.Context) error {

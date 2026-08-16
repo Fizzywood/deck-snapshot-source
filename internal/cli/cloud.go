@@ -34,7 +34,7 @@ type cloudOptions struct {
 
 func runCloud(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage error: cloud requires recovery, connect, unlock, status, disconnect, list, upload, or download.")
+		fmt.Fprintln(stderr, "Usage error: cloud requires recovery, connect, unlock, status, disconnect, list, inspect, upload, download, or trash.")
 		return ExitUsage
 	}
 	switch args[0] {
@@ -50,10 +50,14 @@ func runCloud(args []string, stdout, stderr io.Writer, dependencies Dependencies
 		return runCloudDisconnect(args[1:], stdout, stderr, dependencies)
 	case "list":
 		return runCloudList(args[1:], stdout, stderr, dependencies)
+	case "inspect":
+		return runCloudInspect(args[1:], stdout, stderr, dependencies)
 	case "upload":
 		return runCloudUpload(args[1:], stdout, stderr, dependencies)
 	case "download":
 		return runCloudDownload(args[1:], stdout, stderr, dependencies)
+	case "trash":
+		return runCloudTrash(args[1:], stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "Usage error: unknown cloud subcommand %q.\n", args[0])
 		return ExitUsage
@@ -365,6 +369,33 @@ func runCloudList(args []string, stdout, stderr io.Writer, dependencies Dependen
 	return ExitOK
 }
 
+func runCloudInspect(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
+	flags := flag.NewFlagSet("cloud inspect", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	options := addCloudOptions(flags)
+	detailedOutput := flags.Bool("details", false, "include validated notice metadata in text output")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return ExitOK
+		}
+		return ExitUsage
+	}
+	if flags.NArg() != 1 {
+		fmt.Fprintln(stderr, "Usage error: cloud inspect requires exactly one protected cloud snapshot name.")
+		return ExitUsage
+	}
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
+	if code != ExitOK {
+		return code
+	}
+	value, item, err := manager.Inspect(context.Background(), flags.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "Unable to inspect protected cloud snapshot: %v\n", err)
+		return ExitRuntime
+	}
+	return writeSnapshotDetails(stdout, stderr, options.JSON, *detailedOutput, snapshotDetailsFromManifest("", item.Name, item.Size, value))
+}
+
 func runCloudUpload(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
 	flags := flag.NewFlagSet("cloud upload", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -420,6 +451,32 @@ func runCloudDownload(args []string, stdout, stderr io.Writer, dependencies Depe
 	}
 	value := map[string]string{"path": path}
 	return writeCloudValue(stdout, stderr, options.JSON, value, fmt.Sprintf("Protected snapshot downloaded and validated: %s\n", path))
+}
+
+func runCloudTrash(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
+	flags := flag.NewFlagSet("cloud trash", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	options := addCloudOptions(flags)
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return ExitOK
+		}
+		return ExitUsage
+	}
+	if options.Legacy || flags.NArg() != 1 {
+		fmt.Fprintln(stderr, "Usage error: cloud trash requires exactly one non-legacy protected cloud snapshot name.")
+		return ExitUsage
+	}
+	manager, code := buildCloudManager(context.Background(), *options, dependencies, stderr, true)
+	if code != ExitOK {
+		return code
+	}
+	if err := manager.Trash(context.Background(), flags.Arg(0)); err != nil {
+		fmt.Fprintf(stderr, "Unable to move protected cloud snapshot to Google Drive Trash: %v\n", err)
+		return ExitRuntime
+	}
+	fmt.Fprintln(stdout, "Protected snapshot moved to Google Drive Trash.")
+	return ExitOK
 }
 
 func addCloudOptions(flags *flag.FlagSet) *cloudOptions {

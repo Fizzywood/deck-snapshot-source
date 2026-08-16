@@ -27,6 +27,8 @@ type memoryRunner struct {
 	corruptDownload bool
 	failUpload      bool
 	failList        bool
+	retainDeleted   bool
+	deleteRequests  [][]string
 }
 
 func (runner *memoryRunner) Run(_ context.Context, request Request) (Result, error) {
@@ -95,8 +97,90 @@ func (runner *memoryRunner) Run(_ context.Context, request Request) (Result, err
 		values = append(values, map[string]any{"Name": "../unsafe", "Size": 1, "IsDir": false})
 		encoded, _ := json.Marshal(values)
 		return Result{Stdout: string(encoded)}, nil
+	case "deletefile":
+		if len(request.Args) != 2 || !strings.HasPrefix(request.Args[1], "deck-snapshot-crypt:") {
+			return Result{}, errors.New("unsafe deletefile request")
+		}
+		runner.deleteRequests = append(runner.deleteRequests, append([]string(nil), request.Args...))
+		name := strings.TrimPrefix(request.Args[1], "deck-snapshot-crypt:")
+		if _, exists := runner.objects[name]; !exists {
+			return Result{}, errors.New("remote object missing")
+		}
+		if !runner.retainDeleted {
+			delete(runner.objects, name)
+		}
+		return Result{}, nil
 	}
 	return Result{}, fmt.Errorf("unexpected command: %v", request.Args)
+}
+
+func TestManagerInspectDoesNotPublishCloudOnlySnapshot(t *testing.T) {
+	created := createCloudTestSnapshot(t)
+	runner := &memoryRunner{objects: make(map[string][]byte)}
+	manager := cloudTestManager(t, runner)
+	if err := manager.AcknowledgeRecovery(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	uploaded, err := manager.Upload(context.Background(), created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(created.Path); err != nil {
+		t.Fatal(err)
+	}
+	value, item, err := manager.Inspect(context.Background(), uploaded.Name)
+	if err != nil || value.SnapshotID == "" || item.Name != uploaded.Name || item.Size <= 0 {
+		t.Fatalf("Inspect() = %#v, %#v, %v", value, item, err)
+	}
+	if _, err := os.Lstat(filepath.Join(manager.SnapshotDirectory, uploaded.Name)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Inspect published a normal local snapshot: %v", err)
+	}
+}
+
+func TestManagerTrashUsesOnlyExactSingleFileAndVerifiesListing(t *testing.T) {
+	created := createCloudTestSnapshot(t)
+	runner := &memoryRunner{objects: make(map[string][]byte)}
+	manager := cloudTestManager(t, runner)
+	if err := manager.AcknowledgeRecovery(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	uploaded, err := manager.Upload(context.Background(), created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Trash(context.Background(), uploaded.Name); err != nil {
+		t.Fatalf("Trash() = %v", err)
+	}
+	if len(runner.deleteRequests) != 1 || len(runner.deleteRequests[0]) != 2 || runner.deleteRequests[0][0] != "deletefile" || runner.deleteRequests[0][1] != "deck-snapshot-crypt:"+uploaded.Name {
+		t.Fatalf("Trash issued an unsafe rclone request: %#v", runner.deleteRequests)
+	}
+	if _, exists := runner.objects[uploaded.Name]; exists {
+		t.Fatal("Trash left selected snapshot active")
+	}
+	for _, unsafe := range []string{"../" + uploaded.Name, "*", "recovery.json"} {
+		if err := manager.Trash(context.Background(), unsafe); err == nil {
+			t.Fatalf("Trash accepted %q", unsafe)
+		}
+	}
+	if len(runner.deleteRequests) != 1 {
+		t.Fatalf("unsafe Trash request reached rclone: %#v", runner.deleteRequests)
+	}
+}
+
+func TestManagerTrashFailsWhenSelectedSnapshotRemainsActive(t *testing.T) {
+	created := createCloudTestSnapshot(t)
+	runner := &memoryRunner{objects: make(map[string][]byte), retainDeleted: true}
+	manager := cloudTestManager(t, runner)
+	if err := manager.AcknowledgeRecovery(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	uploaded, err := manager.Upload(context.Background(), created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Trash(context.Background(), uploaded.Name); err == nil || !strings.Contains(err.Error(), "still appears") {
+		t.Fatalf("Trash accepted an active selected snapshot: %v", err)
+	}
 }
 
 func TestManagerProtectedUploadListDownloadRoundtrip(t *testing.T) {

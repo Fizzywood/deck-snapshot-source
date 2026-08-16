@@ -1,6 +1,6 @@
 # Deck Snapshot User Guide
 
-Deck Snapshot is a local-first SteamOS Desktop Mode application. Local backups do not require Google Drive. The v0.1.5 candidate builds on the v0.1.4 desktop baseline while keeping the verified backup, cloud, OAuth, snapshot, and restore contracts unchanged.
+Deck Snapshot is a local-first SteamOS Desktop Mode application. Local backups do not require Google Drive. The v0.1.6 candidate adds focused snapshot management and a user-initiated verified updater while keeping the verified backup, cloud, OAuth, snapshot, and restore contracts unchanged.
 
 ## Install on SteamOS
 
@@ -13,13 +13,13 @@ Wait for the installer result before opening it again. A second launch while ins
 
 For a private prerelease or an offline local-network validation, place all three matching release assets in the XDG Downloads directory before opening the installer. The installer may then use the local archive and checksum, but only when both are regular files beneath that directory and the checksum matches the exact archive digest embedded in the versioned installer. It never trusts an arbitrary local checksum as the release identity.
 
-Deck Snapshot never downloads or installs an update in the background. The **Application → About and updates** area explains the manual update process. To update, download the newest installer from the [verified public release page](https://github.com/Fizzywood/deck-snapshot-releases/releases/latest) and open it; existing backups and settings are kept. Installers and release assets come from the public release repository. Clean source snapshots for public releases are available separately from [the public source repository](https://github.com/Fizzywood/deck-snapshot-source); the development repository and its history remain private. Deck Snapshot never asks users for a GitHub token. Background checks and automatic installation remain fail-closed as documented in [`update-channel-v0.1.1.md`](update-channel-v0.1.1.md).
+When Deck Snapshot opens, it performs one bounded foreground check of the fixed verified public channel. If a newer stable version is available, **Update to vX.Y.Z** appears in the main menu; selecting it shows the installed and available versions before **Update now** starts the verified installer. There is no update daemon, scheduled polling, repeated menu-navigation check, or automatic installation. **Settings & tools → Application → About & Updates** remains the manual status/check page. The installer is downloaded privately, verified against the release manifest SHA-256, and only then started; backups and settings are kept. If a check is unavailable, Deck Snapshot continues to work normally. Installers and release assets come from the public release repository. Clean source snapshots for public releases are available separately from [the public source repository](https://github.com/Fizzywood/deck-snapshot-source); the development repository and its history remain private. Deck Snapshot never asks users for a GitHub token. See [`update-channel-v0.1.1.md`](update-channel-v0.1.1.md).
 
 The application is installed below `~/.local/lib/deck-snapshot`. Its launcher and named icon are installed in the user-local XDG application and icon directories. The installer does not request root access and does not modify the read-only SteamOS system partition.
 
 ## Main screen
 
-The primary menu contains only **Create Backup**, **Restore**, **Snapshots**, **Settings**, **More options**, and **Quit**. Diagnostics are available under **More options → Diagnostics**. Google Drive connection and recovery actions are grouped under **More options → Google Drive**. Migration, manual transfer, disconnect, about, and uninstall actions remain available in the nested advanced or application menus without crowding the normal backup flow.
+The primary menu contains only **Create Backup**, **Snapshots**, **Settings & tools**, and **Quit**. **Settings & tools** contains **Backup settings**, **Google Drive**, **Application**, and **Diagnostics**. Google Drive recovery export/import and disconnect are grouped under **Google Drive → Advanced**. The legacy v0.1.0 recovery action appears only when a supported legacy configuration is actually detected.
 
 The dashboard reports Google Drive connection separately from the latest local backup's storage. **Stored: Local + Cloud** means the latest local backup was also confirmed in Google Drive. **Stored: Local only** means the validated local copy is available even if Drive is disconnected, automatic upload is off, or the latest upload did not complete.
 
@@ -28,7 +28,7 @@ The dashboard reports Google Drive connection separately from the latest local b
 1. Open Deck Snapshot.
 2. Choose **Create Backup**.
 3. Keep the progress window open while Deck Snapshot creates and validates the local backup. If automatic Drive upload is enabled, the same flow then reports the separate protected-upload phase. The archive is published only after its manifest, file inventory, resource limits, and checksums pass.
-4. Choose **Snapshots** to validate and inspect it. From the summary, choose **Restore this backup** to continue directly to the existing exact restore-plan flow, or choose **Restore** separately to select another backup.
+4. Choose **Snapshots** to validate and inspect it. **Validation** confirms archive integrity. If **Notices** are shown, choose **View details** to review grouped capture or compatibility limits before relying on a complete restore. From the summary, choose **Restore this backup** to continue directly to the existing exact restore-plan flow.
 
 Local snapshots are stored below `~/.local/share/deck-snapshot/snapshots` by default.
 
@@ -40,7 +40,7 @@ Deck Snapshot stores protected snapshots at the fixed visible path `My Drive/Dec
 
 To connect a Google account:
 
-1. Choose **More options → Google Drive → Connect or reconnect**.
+1. Choose **Settings & tools → Google Drive → Connect or reconnect**.
 2. Complete authorization in the system browser. Deck Snapshot uses Authorization Code with PKCE S256, a private loopback callback, and only the two scopes above.
 3. For a new account with no Deck Snapshot cloud backups, confirm the one-time setup prompt. Deck Snapshot creates encrypted recovery material, stores it in Google's private application area, reads it back, and verifies the fingerprint before enabling cloud backups.
 
@@ -58,7 +58,7 @@ Connection success creates and reads back the protected fixed Drive folder and v
 
 ### Existing v0.1.0 cloud backups
 
-v0.1.0 used Google's hidden app-folder scope. Choose **More options → Google Drive → Advanced actions → Unlock a v0.1.0 cloud connection** once and enter its existing configuration password only when upgrading an already configured installation. Deck Snapshot validates that complete legacy connection before retaining the password as private local auth state.
+v0.1.0 used Google's hidden app-folder scope. When a supported legacy configuration is detected, choose **Settings & tools → Google Drive → Advanced → Legacy v0.1.0 recovery** and enter its existing configuration password once. Deck Snapshot validates that complete legacy connection before retaining the password as private local auth state.
 
 Before disconnecting a legacy connection, Deck Snapshot preserves its encrypted OAuth configuration and local unlock key in a private migration slot. The old Drive data is not removed. The **Snapshots** browser can explicitly list and download those legacy backups while a new visible-folder connection is active. New uploads through the legacy connection are always rejected.
 
@@ -66,15 +66,15 @@ If the old provider client is already invalid or revoked, **Connect / Reconnect 
 
 ## Upload and download
 
-- Enable automatic upload in **Settings**, or choose the manual upload action below **More options → Google Drive → Advanced actions**. Every upload is downloaded again, validated, and byte-compared before success is reported. An existing cloud object is never replaced.
-- Choose **Snapshots** for one catalog of local, current-cloud, and retained legacy-cloud snapshots. A cloud-only selection is downloaded and fully validated before details or restore planning are offered. An existing local snapshot is never replaced.
+- Enable automatic upload in **Settings & tools → Backup settings**. For a selected local-only backup, **Snapshots** also offers **Upload to Google Drive**. Every upload is downloaded again, validated, and byte-compared before success is reported. An existing cloud object is never replaced.
+- Choose **Snapshots** for one catalog of local, current-cloud, and retained legacy-cloud snapshots. Rows use your Deck's local time (for example, **Today · 14:40**) while archive names remain unchanged. A cloud-only selection is inspected through a private temporary validated download and does not become a persistent local backup unless you choose restore.
 
-Deck Snapshot does not delete cloud snapshots in v0.1.
+For a selected backup, **Delete backup…** is always explicit. Local deletion permanently removes only that one validated archive from Deck Snapshot's snapshot directory. A normal Google Drive deletion moves only the selected cloud copy to Google Drive Trash and verifies it has left the active listing; it is never a permanent, wildcard, directory, or legacy-cloud deletion.
 
 ## Review and run a restore
 
 1. Close Steam and return to Desktop Mode before a real restore.
-2. Choose **Snapshots** if you first want to inspect a validated backup, then choose **Restore this backup** from its summary. Choose **Restore** when you are ready to select a backup and create an exact restore plan.
+2. Choose **Snapshots**, inspect a validated backup, then choose **Restore this backup** from its summary to create an exact restore plan.
 3. Read every file action, plugin action, warning, required-space value, plan ID, and approval hash.
 4. Do not continue if the plan is blocked or targets are unexpected.
 5. Confirm the exact plan only when ready. Deck Snapshot revalidates the plan and target, creates and fully validates a recovery snapshot, and only then starts the bounded transaction.
@@ -89,15 +89,15 @@ The exact v0.1.0 restore engine passed two separately approved production runs, 
 
 ## Diagnostics
 
-Choose **More options → Diagnostics** for a short readiness summary covering Steam, Decky, Google Drive, cloud storage, local snapshot storage, and disk space. A redacted technical report remains available on request.
+Choose **Settings & tools → Diagnostics** for a short readiness summary covering Steam, Decky, Google Drive, cloud storage, local snapshot storage, and disk space. A redacted technical report remains available on request.
 
 ## Disconnect and uninstall
 
-**More options → Google Drive → Connect or reconnect** can explicitly forget an unusable local authorization and open the normal Google browser flow again. This works even when the provider token is revoked or the provider is temporarily unreachable. It does not revoke the provider grant or delete any cloud or local snapshot.
+**Settings & tools → Google Drive → Connect or reconnect** can explicitly forget an unusable local authorization and open the normal Google browser flow again. This works even when the provider token is revoked or the provider is temporarily unreachable. It does not revoke the provider grant or delete any cloud or local snapshot.
 
 The advanced **Disconnect Google Drive locally** action forgets only the active local connection and acknowledgement. It does not revoke the provider grant, delete the appData recovery object, or delete any cloud snapshot. A legacy v0.1.0 connection is privately retained for migration before it is disconnected.
 
-Choose **More options → Application → Uninstall Deck Snapshot** and confirm. The same bounded uninstaller is also available at `~/.local/lib/deck-snapshot/uninstall.sh`. It removes only Deck Snapshot's application binaries, launcher, and named icon. Local backups, recovery snapshots, reports, cloud configuration, managed recovery material, exported fallback recovery files, and unrelated user icons are preserved intentionally.
+Choose **Settings & tools → Application → Uninstall Deck Snapshot** and confirm. The same bounded uninstaller is also available at `~/.local/lib/deck-snapshot/uninstall.sh`. It removes only Deck Snapshot's application binaries, launcher, and named icon. Local backups, recovery snapshots, reports, cloud configuration, managed recovery material, exported fallback recovery files, and unrelated user icons are preserved intentionally.
 
 ## Development disclosure
 

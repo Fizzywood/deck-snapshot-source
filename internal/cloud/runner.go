@@ -55,7 +55,7 @@ func NewRcloneRunner(binary, configPath string) (*CommandRunner, error) {
 		return nil, errors.New("rclone binary and config paths must be absolute")
 	}
 	allowed := map[string]struct{}{
-		"version": {}, "config": {}, "listremotes": {}, "lsjson": {}, "copyto": {}, "mkdir": {}, "about": {}, "obscure": {},
+		"version": {}, "config": {}, "listremotes": {}, "lsjson": {}, "copyto": {}, "deletefile": {}, "mkdir": {}, "about": {}, "obscure": {},
 		"secure-config-create": {},
 	}
 	return &CommandRunner{

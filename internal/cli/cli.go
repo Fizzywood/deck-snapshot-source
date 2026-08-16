@@ -78,6 +78,8 @@ func Run(args []string, stdout, stderr io.Writer, dependencies Dependencies) int
 		return runCloud(args[1:], stdout, stderr, dependencies)
 	case "settings":
 		return runSettings(args[1:], stdout, stderr, dependencies)
+	case "update":
+		return runUpdate(args[1:], stdout, stderr, dependencies)
 	}
 
 	fmt.Fprintf(stderr, "Usage error: unknown command %q. Run 'deck-snapshot help'.\n", args[0])
@@ -314,7 +316,7 @@ type createResponse struct {
 
 func runSnapshot(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage error: snapshot requires create, list, inspect, or validate.")
+		fmt.Fprintln(stderr, "Usage error: snapshot requires create, list, inspect, validate, or delete.")
 		return ExitUsage
 	}
 	switch args[0] {
@@ -326,6 +328,8 @@ func runSnapshot(args []string, stdout, stderr io.Writer, dependencies Dependenc
 		return runSnapshotInspect(args[1:], stdout, stderr)
 	case "validate":
 		return runSnapshotValidate(args[1:], stdout, stderr)
+	case "delete":
+		return runSnapshotDelete(args[1:], stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "Usage error: unknown snapshot subcommand %q.\n", args[0])
 		return ExitUsage
@@ -358,6 +362,7 @@ func runSnapshotInspect(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("snapshot inspect", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	jsonOutput := flags.Bool("json", false, "write a JSON result")
+	detailedOutput := flags.Bool("details", false, "include validated notice metadata in text output")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return ExitOK
@@ -383,26 +388,58 @@ func runSnapshotInspect(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "Unable to inspect the validated snapshot.")
 		return ExitRuntime
 	}
-	response := snapshotDetailsResponse{
-		Path: snapshotPath, Name: filepath.Base(snapshotPath), Size: info.Size(), Valid: true,
-		SnapshotID: value.SnapshotID, CreatedUTC: value.CreatedUTC, AppVersion: value.AppVersion, DeviceName: value.Device.Name,
-		SteamOSVersion: value.Detected.SteamOSVersion, DeckyVersion: value.Detected.DeckyVersion, Files: len(value.Files),
-		Plugins: len(value.Plugins), CSSThemes: len(value.CSSThemes), Artwork: len(value.Artwork), Exclusions: len(value.Exclusions),
-		Warnings: value.Warnings, Components: make(map[string]int), Compatibility: value.Compatibility,
-	}
+	return writeSnapshotDetails(stdout, stderr, *jsonOutput, *detailedOutput, snapshotDetailsFromManifest(snapshotPath, filepath.Base(snapshotPath), info.Size(), value))
+}
+
+func snapshotDetailsFromManifest(path, name string, size int64, value manifest.Manifest) snapshotDetailsResponse {
+	response := snapshotDetailsResponse{Path: path, Name: name, Size: size, Valid: true, SnapshotID: value.SnapshotID, CreatedUTC: value.CreatedUTC, AppVersion: value.AppVersion, DeviceName: value.Device.Name, SteamOSVersion: value.Detected.SteamOSVersion, DeckyVersion: value.Detected.DeckyVersion, Files: len(value.Files), Plugins: len(value.Plugins), CSSThemes: len(value.CSSThemes), Artwork: len(value.Artwork), Exclusions: len(value.Exclusions), Warnings: value.Warnings, Components: make(map[string]int), Compatibility: value.Compatibility}
 	for _, file := range value.Files {
 		response.FileBytes += file.Size
 		response.Components[file.Component]++
 	}
-	if *jsonOutput {
+	return response
+}
+
+func writeSnapshotDetails(stdout, stderr io.Writer, jsonOutput, detailedOutput bool, response snapshotDetailsResponse) int {
+	if jsonOutput {
 		if err := writeJSON(stdout, response); err != nil {
 			fmt.Fprintln(stderr, "Unable to write snapshot details.")
 			return ExitRuntime
 		}
 		return ExitOK
 	}
-	fmt.Fprintf(stdout, "Snapshot: %s\nCreated: %s\nApplication version: %s\nFiles: %d (%d bytes)\nPlugins: %d\nCSS themes/profiles: %d\nArtwork: %d\nWarnings: %d\n",
-		response.SnapshotID, response.CreatedUTC, response.AppVersion, response.Files, response.FileBytes, response.Plugins, response.CSSThemes, response.Artwork, len(response.Warnings))
+	fmt.Fprintf(stdout, "Created: %s\nSize: %d bytes\nFiles: %d (%d bytes)\nPlugins: %d\nCSS themes/profiles: %d\nArtwork: %d\nWarnings: %d\n", response.CreatedUTC, response.Size, response.Files, response.FileBytes, response.Plugins, response.CSSThemes, response.Artwork, len(response.Warnings))
+	if detailedOutput {
+		for _, warning := range response.Warnings {
+			fmt.Fprintf(stdout, "Notice: %s\t%s\t%s\n", warning.Code, warning.Component, warning.Message)
+		}
+	}
+	return ExitOK
+}
+
+func runSnapshotDelete(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
+	flags := flag.NewFlagSet("snapshot delete", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	home := flags.String("home", "", "explicit home root")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return ExitOK
+		}
+		return ExitUsage
+	}
+	if flags.NArg() != 1 {
+		fmt.Fprintln(stderr, "Usage error: snapshot delete requires exactly one snapshot filename.")
+		return ExitUsage
+	}
+	paths, code := resolveSnapshotPaths(dependencies.Environment, *home, "", "", "", stderr)
+	if code != ExitOK {
+		return code
+	}
+	if err := snapshot.DeleteValidated(context.Background(), paths.Snapshots, flags.Arg(0), limits.Default()); err != nil {
+		fmt.Fprintf(stderr, "Snapshot deletion failed safely: %v\n", err)
+		return ExitRuntime
+	}
+	fmt.Fprintln(stdout, "Local snapshot deleted.")
 	return ExitOK
 }
 
@@ -674,6 +711,7 @@ Usage:
   deck-snapshot snapshot list [options]
   deck-snapshot snapshot inspect [--json] <path>
   deck-snapshot snapshot validate [--json] <path>
+  deck-snapshot snapshot delete [--home <path>] <snapshot-filename>
   deck-snapshot restore plan [options] [--details] <snapshot>
   deck-snapshot restore inspect [--json] [--details] <plan>
   deck-snapshot restore run --approve <plan-id> --approval-hash <hash> <plan>
@@ -681,11 +719,13 @@ Usage:
   deck-snapshot cloud connect [--recovery-file <path>] [--initialize]
   deck-snapshot cloud unlock [--recovery-file <path>]
   deck-snapshot cloud status|list [cloud options] [--legacy]
+  deck-snapshot cloud inspect|trash [cloud options] <cloud-name>
   deck-snapshot cloud disconnect [--legacy-password-stdin] [cloud options]
   deck-snapshot cloud upload [cloud options] <snapshot>
   deck-snapshot cloud download [cloud options] [--legacy] <cloud-name>
   deck-snapshot settings show [--json]
   deck-snapshot settings set [--auto-upload true|false] [--recovery-file <path>]
+  deck-snapshot update check|install [--json]
 
 Local discovery, immutable validated snapshots, dry-run restore planning, verified
 recovery, plugin package validation, transactional restore and protected cloud

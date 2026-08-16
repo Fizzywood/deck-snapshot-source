@@ -12,7 +12,7 @@ CHECKSUM=$3
 INSTALLER=$4
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
-if [[ ! "$VERSION" =~ ^v0\.1\.[0-5](-rc\.[1-9][0-9]*|-dev\.[0-9a-f]{40})?$ ]]; then
+if [[ ! "$VERSION" =~ ^v0\.1\.[0-6](-rc\.[1-9][0-9]*|-dev\.[0-9a-f]{40})?$ ]]; then
   printf 'Unsupported installer version: %s\n' "$VERSION" >&2
   exit 2
 fi

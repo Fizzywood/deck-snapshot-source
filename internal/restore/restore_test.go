@@ -138,6 +138,52 @@ func TestBuildPlanIsReadOnlyDeterministicAndStaleAware(t *testing.T) {
 	}
 }
 
+func TestBuildPlanMapsAllowlistedSteamArtworkSidecars(t *testing.T) {
+	sourceHome := filepath.Join(t.TempDir(), "source-home")
+	grid := filepath.Join(sourceHome, ".local", "share", "Steam", "userdata", "100000001", "config", "grid")
+	if err := os.MkdirAll(grid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(grid, "900000001.json"), []byte(`{"nVersion":1,"logoPosition":{"nHeightPct":50,"nWidthPct":75.5,"pinnedPosition":"BottomCenter"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(grid, "900000001_icon.ico"), []byte{0, 0, 1, 0, 1, 0, 16, 16}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := platform.Paths{Home: sourceHome, Decky: filepath.Join(sourceHome, "homebrew"), Steam: filepath.Join(sourceHome, ".local", "share", "Steam")}
+	result, err := discovery.Discover(context.Background(), discovery.Options{Paths: source, AppVersion: "phase3-test", DeviceID: "ds-00000000000000000000000000000000", SnapshotID: "dsnap-sidecars", Now: time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC), Limits: limits.Default()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := snapshot.Create(context.Background(), filepath.Join(t.TempDir(), "snapshots"), result, limits.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := targetPaths(t)
+	plan := buildTestPlan(t, target, created.Path, staticResolver{}, time.Date(2026, 8, 14, 14, 0, 0, 0, time.UTC))
+	expected := map[string]string{
+		"steam/artwork/userdata/100000001/grid/900000001.json":     filepath.Join(target.Steam, "userdata", "100000001", "config", "grid", "900000001.json"),
+		"steam/artwork/userdata/100000001/grid/900000001_icon.ico": filepath.Join(target.Steam, "userdata", "100000001", "config", "grid", "900000001_icon.ico"),
+	}
+	for logical, targetPath := range expected {
+		found := false
+		for _, action := range plan.Actions {
+			if action.LogicalPath == logical {
+				found = true
+				if action.TargetPath != targetPath || action.Operation != "create" {
+					t.Fatalf("sidecar action %s = %#v", logical, action)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("sidecar was not included in the restore plan: %s", logical)
+		}
+	}
+	if err := Revalidate(plan, limits.Default()); err != nil {
+		t.Fatalf("sidecar restore plan did not revalidate: %v", err)
+	}
+}
+
 func TestMoveNoReplaceNeverOverwritesDestination(t *testing.T) {
 	home := t.TempDir()
 	directory := filepath.Join(home, "files")

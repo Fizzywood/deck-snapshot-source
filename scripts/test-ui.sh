@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trap 'printf "Desktop UI test failed at line %s.\n" "$LINENO" >&2' ERR
+
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -54,8 +56,58 @@ if [[ "$*" == "cloud list --recovery-file $TEST_RECOVERY_FILE" && "${UI_SCENARIO
   printf 'deck-snapshot-20260815T010203Z-dsnap-dashboard.tar.gz  42 bytes  2026-08-15T01:02:03Z\n'
   exit 0
 fi
-if [[ "$*" == "snapshot inspect $SNAPSHOT_FILE" ]]; then
-  printf 'Snapshot: dsnap-dashboard\nCreated: 2026-08-15T01:02:03Z\nApplication version: v0.1.4-dev\nFiles: 4 (42 bytes)\nPlugins: 1\nCSS themes/profiles: 2\nArtwork: 3\nWarnings: 0\n'
+if [[ "$*" == "snapshot inspect --details $SNAPSHOT_FILE" ]]; then
+  if [[ "${UI_SCENARIO:-}" == snapshot_blocked ]]; then
+    printf 'Synthetic checksum mismatch.\n' >&2
+    exit 1
+  fi
+  warning_count=0
+  if [[ "${UI_SCENARIO:-}" == snapshot_notices ]]; then
+    warning_count=5
+  elif [[ "${UI_SCENARIO:-}" == snapshot_informational ]]; then
+    warning_count=3
+  fi
+  printf 'Created: 2026-08-15T01:02:03Z\nSize: 42 bytes\nFiles: 4 (42 bytes)\nPlugins: 1\nCSS themes/profiles: 2\nArtwork: 3\nWarnings: %s\n' "$warning_count"
+  if [[ "$warning_count" == 5 ]]; then
+    printf 'Notice: unsupported_grid_file\tsteam\tA non-image Steam grid file was not captured: steam/artwork/userdata/1/grid/100.json\nNotice: unsupported_grid_file\tsteam\tA second non-image Steam grid file was not captured: steam/artwork/userdata/1/grid/200.json\nNotice: plugin_source_unresolved\tdecky\tA plugin source needs verification.\nNotice: orphan_plugin_state\tdecky\tUnmatched Decky data state was not captured: FormerPlugin.\nNotice: orphan_plugin_state\tdecky\tUnmatched Decky settings state was not captured: FormerPlugin.\n'
+  elif [[ "$warning_count" == 3 ]]; then
+    printf 'Notice: plugin_source_unresolved\tdecky\tA plugin source needs verification.\nNotice: orphan_plugin_state\tdecky\tUnmatched Decky data state was not captured: FormerPlugin.\nNotice: orphan_plugin_state\tdecky\tUnmatched Decky settings state was not captured: FormerPlugin.\n'
+  fi
+  exit 0
+fi
+if [[ "$*" == "cloud list"* ]]; then
+  if [[ "${UI_SCENARIO:-}" == "dashboard" ]]; then
+    printf 'deck-snapshot-20260815T010203Z-dsnap-dashboard.tar.gz  42 bytes  2026-08-15T01:02:03Z\n'
+  fi
+  exit 0
+fi
+if [[ "$*" == "cloud upload"* ]]; then
+  printf 'Protected snapshot uploaded and roundtrip-verified.\n'
+  exit 0
+fi
+if [[ "$*" == "update check" ]]; then
+  case "${UI_SCENARIO:-}" in
+    update_available)
+      printf 'Installed: v0.1.3\nAvailable: v0.1.4\nUp to date: false\n'
+      ;;
+    update_offline)
+      printf 'Synthetic offline update check failure.\n' >&2
+      exit 1
+      ;;
+    update_downgrade)
+      printf 'Installed: v0.1.6\nAvailable: v0.1.5\nUp to date: false\n'
+      ;;
+    update_prerelease)
+      printf 'Installed: v0.1.6\nAvailable: v0.1.7-rc.1\nUp to date: false\n'
+      ;;
+    *)
+      printf 'Installed: v0.1.3\nAvailable: v0.1.3\nUp to date: true\n'
+      ;;
+  esac
+  exit 0
+fi
+if [[ "$*" == "update install" && "${UI_SCENARIO:-}" == update_available ]]; then
+  printf 'Installed: v0.1.3\nAvailable: v0.1.4\nUpdate installed: true\n'
   exit 0
 fi
 if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore)$ && "$*" == "restore plan $SNAPSHOT_FILE" ]]; then
@@ -88,29 +140,23 @@ if [[ " $* " == *' --menu '* ]]; then
   if [[ "$UI_SCENARIO" == local ]]; then
     case "$count" in
       1) printf 'create\n' ;;
-      2) printf 'more\n' ;;
+      2) printf 'tools\n' ;;
       3) printf 'doctor\n' ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == cloud ]]; then
     case "$count" in
-      1) printf 'more\n' ;;
+      1) printf 'tools\n' ;;
       2) printf 'cloud\n' ;;
       3) printf 'advanced\n' ;;
-      4) printf 'upload\n' ;;
+      4) printf 'back\n' ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == reconnect ]]; then
     case "$count" in
-      1) printf 'more\n' ;;
+      1) printf 'tools\n' ;;
       2) printf 'cloud\n' ;;
       3) printf 'connect\n' ;;
-      *) printf 'quit\n' ;;
-    esac
-  elif [[ "$UI_SCENARIO" == restore ]]; then
-    case "$count" in
-      1) printf 'restore\n' ;;
-      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == snapshots ]]; then
@@ -127,23 +173,64 @@ if [[ " $* " == *' --menu '* ]]; then
       3) printf 'restore\n' ;;
       *) printf 'quit\n' ;;
     esac
+  elif [[ "$UI_SCENARIO" == snapshot_notices || "$UI_SCENARIO" == snapshot_informational ]]; then
+    case "$count" in
+      1) printf 'snapshots\n' ;;
+      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      3) printf 'notices\n' ;;
+      4) printf 'close\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == snapshot_blocked ]]; then
+    case "$count" in
+      1) printf 'snapshots\n' ;;
+      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      *) printf 'quit\n' ;;
+    esac
   elif [[ "$UI_SCENARIO" == decky_missing ]]; then
     case "$count" in
-      1) printf 'restore\n' ;;
+      1) printf 'snapshots\n' ;;
       2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
-      3) printf 'get_decky\n' ;;
-      4) printf 'check_again\n' ;;
-      5) printf 'close\n' ;;
+      3) printf 'restore\n' ;;
+      4) printf 'get_decky\n' ;;
+      5) printf 'check_again\n' ;;
+      6) printf 'close\n' ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == settings ]]; then
-    if (( count == 1 )); then printf 'settings\n'; else printf 'quit\n'; fi
+    case "$count" in
+      1) printf 'tools\n' ;;
+      2) printf 'backup\n' ;;
+      *) printf 'quit\n' ;;
+    esac
   elif [[ "$UI_SCENARIO" == locked_disconnect ]]; then
     case "$count" in
-      1) printf 'more\n' ;;
+      1) printf 'tools\n' ;;
       2) printf 'cloud\n' ;;
       3) printf 'advanced\n' ;;
       4) printf 'disconnect\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == local_upload ]]; then
+    case "$count" in
+      1) printf 'snapshots\n' ;;
+      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      3) printf 'upload\n' ;;
+      4) printf 'close\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == legacy_menu ]]; then
+    case "$count" in
+      1) printf 'tools\n' ;;
+      2) printf 'cloud\n' ;;
+      3) printf 'advanced\n' ;;
+      4) printf 'back\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == update_available ]]; then
+    case "$count" in
+      1) printf 'update\n' ;;
+      2) printf 'update\n' ;;
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" =~ ^backup_cloud_ || "$UI_SCENARIO" == backup_locked ]]; then
@@ -228,6 +315,7 @@ export HOME="$HOME_DIR"
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
 export KDIALOG="$TEST_ROOT/kdialog"
 export PATH="$TEST_ROOT:$PATH"
+export TZ=UTC
 
 export UI_SCENARIO=local
 "$APP_DIR/deck-snapshot-ui"
@@ -281,7 +369,13 @@ grep -F 'Another backup is already running' "$KDIALOG_LOG" >/dev/null
 rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
 export UI_SCENARIO=cloud
 "$APP_DIR/deck-snapshot-ui"
-grep -Fx "cloud upload --recovery-file $TEST_RECOVERY_FILE $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
+grep -F 'Export recovery key' "$KDIALOG_LOG" >/dev/null
+grep -F 'Import recovery key' "$KDIALOG_LOG" >/dev/null
+grep -F 'Disconnect Google Drive' "$KDIALOG_LOG" >/dev/null
+if grep -F -e 'List protected cloud backups' -e 'Download protected snapshot' -e 'Upload an existing local backup' -e 'Unlock a v0.1.0 cloud connection' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The normal Advanced Google Drive menu exposed a legacy or technical action.\n' >&2
+  exit 1
+fi
 test ! -e "$PASSWORD_COUNT"
 
 : >"$TEST_LOG"
@@ -319,9 +413,12 @@ if grep -F '<td align="left">Updates</td>' "$KDIALOG_LOG" >/dev/null; then
 fi
 grep -F 'v0.1.3 development build' "$KDIALOG_LOG" >/dev/null
 grep -F 'Create Backup' "$KDIALOG_LOG" >/dev/null
-grep -F ' Restore ' "$KDIALOG_LOG" >/dev/null
 grep -F ' Snapshots ' "$KDIALOG_LOG" >/dev/null
-grep -F ' More options ' "$KDIALOG_LOG" >/dev/null
+grep -F ' Settings & tools ' "$KDIALOG_LOG" >/dev/null
+if grep -F -e ' restore Restore' -e ' settings Settings' -e ' More options ' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The primary dashboard retained a redundant menu action.\n' >&2
+  exit 1
+fi
 if grep -F ' doctor Diagnostics' "$KDIALOG_LOG" >/dev/null; then
   printf 'The primary dashboard still exposed Diagnostics.\n' >&2
   exit 1
@@ -332,6 +429,57 @@ if grep -F 'Unlock a v0.1.0 cloud connection' "$KDIALOG_LOG" >/dev/null; then
 fi
 grep -Fx "cloud status --recovery-file $TEST_RECOVERY_FILE" "$TEST_LOG" >/dev/null
 grep -Fx "cloud list --recovery-file $TEST_RECOVERY_FILE" "$TEST_LOG" >/dev/null
+test "$(grep -Fc 'update check' "$TEST_LOG")" -eq 1
+if grep -F ' update Update to ' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The primary dashboard exposed an update action without a newer stable release.\n' >&2
+  exit 1
+fi
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT"
+export UI_SCENARIO=update_available
+"$APP_DIR/deck-snapshot-ui"
+grep -F ' update Update to v0.1.4 ' "$KDIALOG_LOG" >/dev/null
+grep -F 'Installed: v0.1.3' "$KDIALOG_LOG" >/dev/null
+grep -F 'Available: v0.1.4' "$KDIALOG_LOG" >/dev/null
+grep -F 'Update now' "$KDIALOG_LOG" >/dev/null
+grep -F 'Not now' "$KDIALOG_LOG" >/dev/null
+grep -Fx 'update install' "$TEST_LOG" >/dev/null
+test "$(grep -Fc 'update check' "$TEST_LOG")" -eq 1
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT"
+export UI_SCENARIO=update_offline
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'Create Backup' "$KDIALOG_LOG" >/dev/null
+grep -F ' Settings & tools ' "$KDIALOG_LOG" >/dev/null
+if grep -F ' update Update to ' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The primary dashboard exposed an update action after an offline check failure.\n' >&2
+  exit 1
+fi
+test "$(grep -Fc 'update check' "$TEST_LOG")" -eq 1
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT"
+export UI_SCENARIO=update_downgrade
+"$APP_DIR/deck-snapshot-ui"
+if grep -F ' update Update to ' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The primary dashboard exposed a downgrade as an update.\n' >&2
+  exit 1
+fi
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT"
+export UI_SCENARIO=update_prerelease
+"$APP_DIR/deck-snapshot-ui"
+if grep -F ' update Update to ' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The primary dashboard exposed a prerelease as an update.\n' >&2
+  exit 1
+fi
 
 : >"$TEST_LOG"
 rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
@@ -344,17 +492,58 @@ grep -Fx "cloud connect --recovery-file $TEST_RECOVERY_FILE" "$TEST_LOG" >/dev/n
 rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
 export UI_SCENARIO=snapshots
 "$APP_DIR/deck-snapshot-ui"
-grep -Fx "snapshot inspect $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
+grep -Fx "snapshot inspect --details $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
 if grep -F 'restore plan ' "$TEST_LOG" >/dev/null; then
   printf 'Snapshot browsing unexpectedly started restore planning.\n' >&2
   exit 1
 fi
-grep -F 'Backup date/time: 2026-08-15T01:02:03Z' "$KDIALOG_LOG" >/dev/null
-grep -F 'Validation: Valid' "$KDIALOG_LOG" >/dev/null
+grep -E 'Backup date/time: (Today|Yesterday|15 Aug 2026) · 01:02' "$KDIALOG_LOG" >/dev/null
 grep -F 'Decky plugins: 1' "$KDIALOG_LOG" >/dev/null
 grep -F 'CSS Loader themes/profiles: 2' "$KDIALOG_LOG" >/dev/null
 grep -F 'Steam artwork: 3' "$KDIALOG_LOG" >/dev/null
+grep -F 'Validation: ✓ Valid' "$KDIALOG_LOG" >/dev/null
+if grep -F -e 'Notices:' -e 'Valid with ' "$KDIALOG_LOG" >/dev/null; then
+  printf 'A zero-notice snapshot exposed misleading warning wording.\n' >&2
+  exit 1
+fi
 grep -F 'Restore this backup' "$KDIALOG_LOG" >/dev/null
+grep -E -- '--menu Backup date/time: (Today|Yesterday|15 Aug 2026) · 01:02' "$KDIALOG_LOG" >/dev/null
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+export UI_SCENARIO=snapshot_notices
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'Validation: ✓ Valid' "$KDIALOG_LOG" >/dev/null
+grep -F 'Restore coverage: Partial' "$KDIALOG_LOG" >/dev/null
+grep -F 'Notices: 5' "$KDIALOG_LOG" >/dev/null
+grep -F 'View details' "$KDIALOG_LOG" >/dev/null
+grep -F '• 2 Steam artwork logo-position metadata files were excluded' "$KDIALOG_LOG" >/dev/null
+grep -F '• 1 Decky plugins need official source verification before restore' "$KDIALOG_LOG" >/dev/null
+grep -F '• 1 stale or unmatched Decky plugin-state folders were excluded' "$KDIALOG_LOG" >/dev/null
+if grep -F 'Valid with 5 warnings' "$KDIALOG_LOG" >/dev/null; then
+  printf 'The notice summary retained the misleading validation wording.\n' >&2
+  exit 1
+fi
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+export UI_SCENARIO=snapshot_informational
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'Notices: 3' "$KDIALOG_LOG" >/dev/null
+if grep -F 'Restore coverage:' "$KDIALOG_LOG" >/dev/null; then
+  printf 'Informational notices incorrectly implied partial restore coverage.\n' >&2
+  exit 1
+fi
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+export UI_SCENARIO=snapshot_blocked
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'Snapshot blocked' "$KDIALOG_LOG" >/dev/null
+grep -F 'This backup could not be validated safely.' "$KDIALOG_LOG" >/dev/null
 
 : >"$TEST_LOG"
 : >"$KDIALOG_LOG"
@@ -362,7 +551,7 @@ rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
 touch "$TEST_PLAN_FILE"
 export UI_SCENARIO=snapshot_restore
 "$APP_DIR/deck-snapshot-ui"
-test "$(grep -Fc "snapshot inspect $SNAPSHOT_FILE" "$TEST_LOG")" -eq 1
+test "$(grep -Fc "snapshot inspect --details $SNAPSHOT_FILE" "$TEST_LOG")" -eq 1
 grep -Fx "restore plan $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
 grep -Fx "restore inspect --details $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
 grep -Fx "restore run --approve restore-aaaaaaaaaaaaaaaa --approval-hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
@@ -378,19 +567,43 @@ export UI_SCENARIO=settings
 grep -Fx 'settings set --auto-upload true' "$TEST_LOG" >/dev/null
 
 : >"$TEST_LOG"
-rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
-touch "$TEST_PLAN_FILE"
-export UI_SCENARIO=restore
-"$APP_DIR/deck-snapshot-ui"
-grep -Fx "restore plan $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
-grep -Fx "restore inspect --details $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
-grep -Fx "restore run --approve restore-aaaaaaaaaaaaaaaa --approval-hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
-
-: >"$TEST_LOG"
 rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT" "$HOME/.config/deck-snapshot/cloud/config-password"
 export UI_SCENARIO=locked_disconnect
 "$APP_DIR/deck-snapshot-ui"
 grep -Fx "cloud disconnect --legacy-password-stdin --recovery-file $TEST_RECOVERY_FILE" "$TEST_LOG" >/dev/null
 test "$(<"$PASSWORD_COUNT")" -eq 1
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+touch "$HOME/.config/deck-snapshot/cloud/config-password"
+export UI_SCENARIO=local_upload
+"$APP_DIR/deck-snapshot-ui"
+grep -Fx "cloud upload $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
+grep -F 'Storage: Local + Google Drive' "$KDIALOG_LOG" >/dev/null
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT"
+mkdir -p -- "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0"
+touch "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/rclone.conf" "$HOME/.config/deck-snapshot/cloud/legacy-v0.1.0/config-password"
+export UI_SCENARIO=legacy_menu
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'Legacy v0.1.0 recovery' "$KDIALOG_LOG" >/dev/null
+
+(
+  export DECK_SNAPSHOT_UI_LIBRARY=1
+  # shellcheck source=/dev/null
+  source "$APP_DIR/deck-snapshot-ui"
+  today_name="deck-snapshot-$(TZ=UTC date '+%Y%m%dT%H%M%SZ')-dsnap-today.tar.gz"
+  yesterday_name="deck-snapshot-$(TZ=UTC date -d 'yesterday' '+%Y%m%dT%H%M%SZ')-dsnap-yesterday.tar.gz"
+  test "$(format_snapshot_name "$today_name")" = "$(date '+Today · %H:%M')"
+  test "$(format_snapshot_name "$yesterday_name")" = "$(date -d 'yesterday' '+Yesterday · %H:%M')"
+  test "$(format_snapshot_name 'deck-snapshot-20200115T134046Z-dsnap-older.tar.gz')" = "$(date -d '2020-01-15 13:40 UTC' '+%d %b %Y · %H:%M')"
+  test "$(format_snapshot_size 42)" = '42 bytes'
+  test "$(format_snapshot_size 1024)" = '1.0 KB'
+  test "$(format_snapshot_size 109964318)" = '104.9 MB'
+  test "$(format_snapshot_size invalid)" = 'Unknown'
+)
 
 printf 'Desktop UI core-invocation test passed.\n'

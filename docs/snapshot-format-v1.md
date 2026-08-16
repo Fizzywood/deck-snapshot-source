@@ -76,7 +76,7 @@ Limits apply during discovery, creation and validation. The validator also force
 
 Discovery never follows a symbolic link. Non-regular files are excluded with a warning. A supported text configuration file over 1 MiB is excluded because it cannot pass the bounded credential scan. Known secret-like filenames and supported text files containing likely token/password/key fields are excluded entirely and reported without their contents.
 
-The CSS Loader adapter captures the verified themes tree, including profiles, configuration, priority, `STORE` state and resources. The Steam adapter captures image files in numeric userdata grid directories and selected numeric library-cache icon files. Exact Steam client filename semantics remain marked unverified until real current hardware validation.
+The CSS Loader adapter captures the verified themes tree, including profiles, configuration, priority, `STORE` state and resources. The Steam adapter captures image files in numeric userdata grid directories, selected numeric library-cache icon files, and two narrowly validated grid sidecars: version-1 logo-position JSON metadata (maximum 4 KiB, fixed schema) and numeric `_icon.ico` files with a PNG or ICO header (maximum 1 MiB). It does not capture `shortcuts.vdf` or arbitrary Steam state. Exact Steam client filename semantics remain marked unverified until real current hardware validation.
 
 ## Validation versus restore
 
