@@ -75,9 +75,9 @@ For a selected backup, **Delete backup…** is always explicit. Local deletion p
 
 1. Close Steam and return to Desktop Mode before a real restore.
 2. Choose **Snapshots**, inspect a validated backup, then choose **Restore this backup** from its summary to create an exact restore plan.
-3. Read every file action, plugin action, warning, required-space value, plan ID, and approval hash.
-4. Do not continue if the plan is blocked or targets are unexpected.
-5. Confirm the exact plan only when ready. Deck Snapshot revalidates the plan and target, creates and fully validates a recovery snapshot, and only then starts the bounded transaction.
+3. Review the plain-language change summary. Use **Technical details** only when you need the exact plan information.
+4. Do not continue if Deck Snapshot says it cannot continue safely.
+5. Confirm the restore only when ready. Deck Snapshot revalidates the sealed plan and target, creates and fully validates a safety backup, restores the supported customization scope, refreshes the supported runtime, and verifies the result.
 6. Keep the reported recovery snapshot and restore report.
 7. Return to Gaming Mode only after the report is successful or its warnings are understood.
 

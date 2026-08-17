@@ -25,7 +25,7 @@ import (
 	"github.com/Fizzywood/deck-snapshot/internal/snapshot"
 )
 
-const PlanVersion = "1.1"
+const PlanVersion = "1.2"
 
 type Plan struct {
 	PlanVersion       string                   `json:"plan_version"`
@@ -71,6 +71,8 @@ type PluginAction struct {
 	Operation           string `json:"operation"`
 	Reason              string `json:"reason,omitempty"`
 	ExistingFingerprint string `json:"existing_fingerprint,omitempty"`
+	ExistingName        string `json:"existing_name,omitempty"`
+	ExistingAuthor      string `json:"existing_author,omitempty"`
 	ExistingVersion     string `json:"existing_version,omitempty"`
 	ExistingFiles       int    `json:"existing_files,omitempty"`
 	ExistingBytes       int64  `json:"existing_bytes,omitempty"`
@@ -119,6 +121,26 @@ type PlanOptions struct {
 	Limits         limits.Limits
 	Resolver       pluginstore.Resolver
 	DeckyInstaller deckyapi.Installer
+}
+
+// HasMutations reports whether the sealed plan would change supported state.
+func (plan Plan) HasMutations() bool {
+	for _, action := range plan.Actions {
+		if action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove" {
+			return true
+		}
+	}
+	for _, action := range plan.PluginActions {
+		if action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove" {
+			return true
+		}
+	}
+	for _, action := range plan.PreservedSettings {
+		if action.Operation == "create" {
+			return true
+		}
+	}
+	return false
 }
 
 func BuildPlan(ctx context.Context, options PlanOptions) (Plan, error) {
@@ -171,6 +193,11 @@ func BuildPlan(ctx context.Context, options PlanOptions) (Plan, error) {
 			plan.Blocking = true
 		}
 	}
+	convergence, err := buildConvergenceActions(ctx, options.Paths, value, options.AppVersion, options.Now, options.Limits)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan.Actions = append(plan.Actions, convergence...)
 	if options.Resolver == nil {
 		for _, plugin := range value.Plugins {
 			plan.Plugins = append(plan.Plugins, pluginstore.Resolution{SnapshotDirectory: plugin.Directory, SnapshotName: plugin.Name, SnapshotAuthor: plugin.Author, SnapshotVersion: plugin.Version, Status: "resolver_unavailable", Message: "Official current-stable plugin resolution was not available.", Blocking: true})
@@ -210,7 +237,7 @@ func BuildPlan(ctx context.Context, options PlanOptions) (Plan, error) {
 		}
 	}
 	for _, action := range plan.Actions {
-		if action.Operation == "create" || action.Operation == "replace" {
+		if action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove" {
 			if err := addRequiredBytes(&plan, 2*action.Size+2*action.ExistingSize); err != nil {
 				return Plan{}, err
 			}
@@ -227,7 +254,7 @@ func BuildPlan(ctx context.Context, options PlanOptions) (Plan, error) {
 		}
 	}
 	for _, action := range plan.PluginActions {
-		if action.Operation == "create" || action.Operation == "replace" {
+		if action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove" {
 			existingCopies := action.ExistingBytes
 			if action.Method == pluginMethodDeckyAPI {
 				if action.ExistingBytes > math.MaxInt64/3 {
@@ -240,7 +267,7 @@ func BuildPlan(ctx context.Context, options PlanOptions) (Plan, error) {
 			}
 		}
 	}
-	plan.Warnings = append(plan.Warnings, "Steam and Decky must be stopped before a real restore; automatic restart is not hardware-verified.")
+	plan.Warnings = append(plan.Warnings, "Deck Snapshot refreshes the supported Decky and Steam runtime after a restore; a refresh failure rolls the transaction back.")
 	plan.Warnings = append(plan.Warnings, "Non-Steam shortcuts.vdf remains unmodified.")
 	sort.Slice(plan.Actions, func(i, j int) bool { return plan.Actions[i].LogicalPath < plan.Actions[j].LogicalPath })
 	plan.Blocking = false
@@ -269,7 +296,7 @@ func BuildPlan(ctx context.Context, options PlanOptions) (Plan, error) {
 func bindDeckyAPISettingsRecovery(plan *Plan, paths platform.Paths, resourceLimits limits.Limits) {
 	deckyAPIMutation := false
 	for _, action := range plan.PluginActions {
-		deckyAPIMutation = deckyAPIMutation || (action.Method == pluginMethodDeckyAPI && (action.Operation == "create" || action.Operation == "replace"))
+		deckyAPIMutation = deckyAPIMutation || (action.Method == pluginMethodDeckyAPI && (action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove"))
 	}
 	if !deckyAPIMutation {
 		return
@@ -278,7 +305,7 @@ func bindDeckyAPISettingsRecovery(plan *Plan, paths platform.Paths, resourceLimi
 	if err != nil {
 		for index := range plan.PluginActions {
 			action := &plan.PluginActions[index]
-			if action.Method == pluginMethodDeckyAPI && (action.Operation == "create" || action.Operation == "replace") {
+			if action.Method == pluginMethodDeckyAPI && (action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove") {
 				action.Method = ""
 				action.Operation = "blocked"
 				action.Reason = "Decky Loader settings side effects cannot be recovered safely: " + err.Error()
@@ -428,7 +455,7 @@ func fingerprintTargets(actions []Action, plugins []PluginAction, preserved []Pr
 		fmt.Fprintf(hash, "%s\x00%s\x00%s\x00%d\x00%s\x00%d\n", action.LogicalPath, action.TargetPath, action.Operation, action.ExistingSize, action.ExistingSHA256, action.ExistingMode)
 	}
 	for _, action := range plugins {
-		fmt.Fprintf(hash, "plugin\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d\n", action.Directory, action.TargetPath, action.PreservePath, action.Operation, action.Method, action.ExistingFingerprint, action.ExistingFiles, action.ExistingBytes)
+		fmt.Fprintf(hash, "plugin\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d\n", action.Directory, action.TargetPath, action.PreservePath, action.Operation, action.Method, action.ExistingFingerprint, action.ExistingName, action.ExistingAuthor, action.ExistingVersion, action.ExistingFiles, action.ExistingBytes)
 	}
 	for _, action := range preserved {
 		fmt.Fprintf(hash, "preserve\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\n", action.LogicalPath, action.Plugin, action.PreservePath, action.Operation, action.Size, action.SHA256)
@@ -491,9 +518,12 @@ func ValidatePlan(plan Plan) error {
 			if action.ExistingSHA256 != "" || action.ExistingSize != 0 || action.ExistingMode != 0 {
 				return fmt.Errorf("create action has existing state for %q", action.LogicalPath)
 			}
-		case "replace", "unchanged":
-			if action.ExistingSize < 0 || !validSHA256(action.ExistingSHA256) {
+		case "replace", "unchanged", "remove":
+			if action.ExistingSize < 0 || !validSHA256(action.ExistingSHA256) || action.ExistingMode&^0o777 != 0 {
 				return fmt.Errorf("existing state is invalid for %q", action.LogicalPath)
+			}
+			if action.Operation == "remove" && (action.Size != action.ExistingSize || action.SHA256 != action.ExistingSHA256) {
+				return fmt.Errorf("remove action identity is inconsistent for %q", action.LogicalPath)
 			}
 		case "blocked":
 			if action.Reason == "" {
@@ -575,6 +605,11 @@ func ValidatePlan(plan Plan) error {
 				return errors.New("replace plugin action version is invalid")
 			}
 			deckyAPIMutation = deckyAPIMutation || action.Method == pluginMethodDeckyAPI
+		case "remove":
+			if action.Method != pluginMethodDeckyAPI || !validSHA256(action.ExistingFingerprint) || action.ExistingFiles < 1 || action.ExistingBytes < 0 || action.ExistingName == "" || action.ExistingAuthor == "" || action.ExistingVersion == "" {
+				return errors.New("remove plugin action is invalid")
+			}
+			deckyAPIMutation = true
 		case "unchanged":
 			if action.Method != pluginMethodNone || !validSHA256(action.ExistingFingerprint) || action.ExistingFiles < 1 || action.ExistingBytes < 0 {
 				return errors.New("unchanged plugin action is invalid")
@@ -587,8 +622,17 @@ func ValidatePlan(plan Plan) error {
 			return errors.New("unknown restore plugin operation")
 		}
 	}
-	if len(plan.PluginActions) != len(plan.Plugins) {
-		return errors.New("restore plugin resolutions and actions differ")
+	for _, resolution := range plan.Plugins {
+		found := false
+		for _, action := range plan.PluginActions {
+			if action.Directory == resolution.SnapshotDirectory {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("restore plugin resolutions and actions differ")
+		}
 	}
 	if deckyAPIMutation {
 		guard := plan.DeckyLoaderGuard

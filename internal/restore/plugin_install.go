@@ -201,6 +201,25 @@ func installPreparedPluginWithDecky(ctx context.Context, installer deckyapi.Inst
 	return item, nil
 }
 
+func removeDeckyPlugin(ctx context.Context, installer deckyapi.Installer, action PluginAction, resourceLimits limits.Limits) (installedPlugin, error) {
+	if installer == nil || action.Method != pluginMethodDeckyAPI || action.Operation != "remove" {
+		return installedPlugin{}, errors.New("Decky Loader removal boundary is unavailable")
+	}
+	fingerprint, files, bytes, err := fingerprintDeckyManagedPluginTree(action.TargetPath, resourceLimits)
+	metadata, metadataErr := pluginstore.InspectPackageMetadata(action.TargetPath)
+	if err != nil || metadataErr != nil || fingerprint != action.ExistingFingerprint || files != action.ExistingFiles || bytes != action.ExistingBytes || metadata.Name != action.ExistingName || metadata.Author != action.ExistingAuthor || metadata.Version != action.ExistingVersion {
+		return installedPlugin{}, errors.Join(fmt.Errorf("extra Decky plugin changed after approval: %q", action.Directory), err, metadataErr)
+	}
+	item := installedPlugin{Action: action, Resolution: pluginstore.Resolution{SnapshotDirectory: action.Directory, StoreName: action.ExistingName, StoreAuthor: action.ExistingAuthor, ResolvedVersion: action.ExistingVersion}, MutationStarted: true}
+	if err := installer.Uninstall(ctx, action.ExistingName); err != nil {
+		return item, fmt.Errorf("remove extra plugin through Decky Loader %q: %w", action.Directory, err)
+	}
+	if _, err := os.Lstat(action.TargetPath); !errors.Is(err, os.ErrNotExist) {
+		return item, fmt.Errorf("Decky Loader did not remove the approved extra plugin: %q", action.Directory)
+	}
+	return item, nil
+}
+
 func rollbackInstalledPlugins(home string, installed []installedPlugin, resourceLimits limits.Limits) error {
 	return rollbackInstalledPluginsWithDecky(context.Background(), home, installed, resourceLimits, nil, nil)
 }
@@ -293,6 +312,31 @@ func rollbackDeckyInstalledPlugin(ctx context.Context, item installedPlugin, res
 		}
 		if _, err := os.Lstat(item.Action.TargetPath); !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("Decky Loader did not remove the created plugin during rollback: %q", item.Action.Directory)
+		}
+		return nil
+	}
+	if item.Action.Operation == "remove" {
+		if statErr == nil {
+			if !info.IsDir() || isLinkOrReparsePoint(info) {
+				return fmt.Errorf("removed Decky plugin target is unsafe during rollback: %q", item.Action.Directory)
+			}
+			fingerprint, files, bytes, err := fingerprintDeckyManagedPluginTree(item.Action.TargetPath, resourceLimits)
+			metadata, metadataErr := pluginstore.InspectPackageMetadata(item.Action.TargetPath)
+			if err == nil && metadataErr == nil && fingerprint == item.Action.ExistingFingerprint && files == item.Action.ExistingFiles && bytes == item.Action.ExistingBytes && metadata.Name == item.Action.ExistingName && metadata.Author == item.Action.ExistingAuthor && metadata.Version == item.Action.ExistingVersion {
+				return nil
+			}
+			return errors.Join(fmt.Errorf("removed Decky plugin changed during rollback: %q", item.Action.Directory), err, metadataErr)
+		}
+		if !errors.Is(statErr, os.ErrNotExist) || recovery.Archive == "" || !validSHA256(recovery.SHA256) {
+			return fmt.Errorf("validated plugin recovery package is unavailable for removed plugin %q", item.Action.Directory)
+		}
+		if err := installer.Install(ctx, deckyapi.InstallRequest{ArchivePath: recovery.Archive, Name: item.Action.ExistingName, Version: item.Action.ExistingVersion, SHA256: recovery.SHA256, Replace: false}); err != nil {
+			return fmt.Errorf("restore removed plugin through Decky Loader %q: %w", item.Action.Directory, err)
+		}
+		fingerprint, files, bytes, verifyErr := fingerprintDeckyManagedPluginTree(item.Action.TargetPath, resourceLimits)
+		metadata, metadataErr := pluginstore.InspectPackageMetadata(item.Action.TargetPath)
+		if verifyErr != nil || metadataErr != nil || fingerprint != item.Action.ExistingFingerprint || files != item.Action.ExistingFiles || bytes != item.Action.ExistingBytes || metadata.Name != item.Action.ExistingName || metadata.Author != item.Action.ExistingAuthor || metadata.Version != item.Action.ExistingVersion {
+			return errors.Join(fmt.Errorf("Decky Loader rollback failed for removed plugin %q", item.Action.Directory), verifyErr, metadataErr)
 		}
 		return nil
 	}

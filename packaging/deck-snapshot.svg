@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-labelledby="title">
-  <title id="title">Deck Snapshot</title>
-  <rect x="4" y="4" width="56" height="56" rx="14" fill="#2563eb"/>
-  <rect x="17" y="15" width="32" height="26" rx="6" fill="#bfdbfe"/>
-  <rect x="13" y="23" width="36" height="28" rx="7" fill="#ffffff"/>
-  <path d="M24 34a10 10 0 0 1 17-3" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
-  <path d="m39 26 4 6-7 1" fill="#2563eb"/>
-  <path d="M40 41a10 10 0 0 1-17 2" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
-  <path d="m25 48-4-6 7-1" fill="#2563eb"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <path d="M96 218 Q96 202 110 194 L242 118 Q256 110 270 118 L402 194 Q416 202 416 218 L416 326 Q416 342 402 350 L270 426 Q256 434 242 426 L110 350 Q96 342 96 326 Z" fill="#2A2E35"/>
+  <path d="M96 218 L256 310 L256 430 Q249 430 242 426 L110 350 Q96 342 96 326 Z" fill="#343A43"/>
+  <path d="M416 218 L256 310 L256 430 Q263 430 270 426 L402 350 Q416 342 416 326 Z" fill="#1F2329"/>
+  <path d="M121 210 L244 139 Q256 132 268 139 L391 210 Q400 215 391 221 L268 292 Q256 299 244 292 L121 221 Q112 215 121 210 Z" fill="#7C3AED"/>
+  <path d="M163 211 L247 163 Q256 158 265 163 L349 211 Q357 216 349 221 L265 269 Q256 274 247 269 L163 221 Q155 216 163 211 Z" fill="#A78BFA"/>
+  <circle cx="222" cy="215" r="9" fill="#F5F3FF"/>
+  <circle cx="256" cy="196" r="9" fill="#F5F3FF"/>
+  <circle cx="290" cy="215" r="9" fill="#F5F3FF"/>
+  <path d="M182 363 L218 384 L218 404 L182 383 Z" fill="#8B5CF6"/>
+  <path d="M96 218 Q96 202 110 194 L242 118 Q256 110 270 118 L402 194 Q416 202 416 218 L416 326 Q416 342 402 350 L270 426 Q256 434 242 426 L110 350 Q96 342 96 326 Z" fill="none" stroke="#626A75" stroke-width="8" stroke-linejoin="round"/>
 </svg>

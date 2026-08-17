@@ -46,6 +46,8 @@ Treat snapshot archives, manifests, plugin metadata, cloud listings, downloaded 
 - Keep recovery data after failures and include its exact user-visible location in the report.
 - Stop dependent risky steps after a failure; isolate independent component failures only when continuation cannot worsen recovery.
 - Rollback must use the same validation, planning and target-safety controls as restore.
+- A convergence removal must be an explicit immutable-plan action bound to the exact existing file identity, including mode, and covered by the validated recovery snapshot before mutation. Never use absence from a snapshot as sufficient evidence to remove arbitrary state.
+- Runtime-owned Decky, CSS Loader, and Steam state must be refreshed through an exact supported bounded control path after a successful restore; a failed refresh is a transaction failure and must not be reported as success.
 
 ## Deletion
 

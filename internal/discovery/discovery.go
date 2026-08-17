@@ -64,6 +64,7 @@ type builder struct {
 	manifest   manifest.Manifest
 	candidates []Candidate
 	seen       map[string]struct{}
+	warnings   map[string]struct{}
 	counter    limits.Counter
 }
 
@@ -92,6 +93,7 @@ func Discover(ctx context.Context, options Options) (Result, error) {
 		context:  ctx,
 		manifest: manifest.New(options.SnapshotID, options.AppVersion, options.DeviceID, options.DeviceName, options.Now),
 		seen:     make(map[string]struct{}),
+		warnings: make(map[string]struct{}),
 		counter:  limits.Counter{Limits: options.Limits},
 	}
 	state.manifest.Detected.SteamOSVersion = detectSteamOSVersion(options.OSReleasePath)
@@ -296,6 +298,11 @@ func (b *builder) exclude(logicalPath, component, reason string) {
 }
 
 func (b *builder) warn(code, component, message string) {
+	key := code + "\x00" + component + "\x00" + message
+	if _, exists := b.warnings[key]; exists {
+		return
+	}
+	b.warnings[key] = struct{}{}
 	b.manifest.Warnings = append(b.manifest.Warnings, manifest.Warning{Code: code, Component: component, Message: message})
 }
 

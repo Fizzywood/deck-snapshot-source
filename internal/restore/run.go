@@ -42,19 +42,73 @@ type Report struct {
 }
 
 type RunOptions struct {
-	Plan              Plan
-	ApprovedPlanID    string
-	ApprovedHash      string
-	Limits            limits.Limits
-	WorkDirectory     string
-	RecoveryDirectory string
-	ReportDirectory   string
-	Now               func() time.Time
-	AvailableBytes    func(string) (uint64, error)
-	BeforeAction      func(Action) error
-	BeforePlugin      func(PluginAction) error
-	HTTPClient        *http.Client
-	DeckyInstaller    deckyapi.Installer
+	Plan               Plan
+	ApprovedPlanID     string
+	ApprovedHash       string
+	Limits             limits.Limits
+	WorkDirectory      string
+	RecoveryDirectory  string
+	ReportDirectory    string
+	Now                func() time.Time
+	AvailableBytes     func(string) (uint64, error)
+	BeforeAction       func(Action) error
+	BeforePlugin       func(PluginAction) error
+	HTTPClient         *http.Client
+	DeckyInstaller     deckyapi.Installer
+	RuntimeCoordinator RuntimeCoordinator
+	Rebooter           Rebooter
+}
+
+// RuntimeCoordinator refreshes the bounded Decky/Steam runtime after an
+// otherwise successful mutation. Restore deliberately treats an unavailable
+// coordinator or a failed refresh as a transaction failure: written files are
+// not reported as a completed restore while the live UI can still be stale.
+type RuntimeCoordinator interface {
+	Refresh(context.Context, TargetReference) error
+}
+
+type deckyRuntimeCoordinator struct {
+	controller deckyapi.Controller
+	restarter  deckyapi.Restarter
+}
+
+// NewDeckyRuntimeCoordinator exposes only Decky's supported, version-bounded
+// restart route. It never executes a shell command or controls arbitrary
+// processes.
+func NewDeckyRuntimeCoordinator(controller deckyapi.Controller) RuntimeCoordinator {
+	if controller == nil {
+		return nil
+	}
+	return deckyRuntimeCoordinator{controller: controller, restarter: controller}
+}
+
+func (coordinator deckyRuntimeCoordinator) Refresh(ctx context.Context, target TargetReference) error {
+	if err := coordinator.restarter.Restart(ctx, target.Decky); err != nil {
+		return fmt.Errorf("refresh Decky Loader and Steam runtime: %w", err)
+	}
+	return nil
+}
+
+func (coordinator deckyRuntimeCoordinator) QuiesceSteam(ctx context.Context) error {
+	return gracefulSteamShutdown(ctx)
+}
+
+func requiresRuntimeRefresh(plan Plan) bool {
+	for _, action := range plan.Actions {
+		if action.Operation != "create" && action.Operation != "replace" && action.Operation != "remove" {
+			continue
+		}
+		switch action.Component {
+		case "decky", "css-loader", "steam":
+			return true
+		}
+	}
+	for _, action := range plan.PluginActions {
+		if action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove" {
+			return true
+		}
+	}
+	return false
 }
 
 // Run applies an exact approved plan only after stale-state checks, selected
@@ -86,6 +140,11 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		finish()
 		return report, err
 	}
+	if !options.Plan.HasMutations() {
+		report.Status = "already_matches"
+		finish()
+		return report, nil
+	}
 	for _, directory := range []string{options.WorkDirectory, options.RecoveryDirectory, options.ReportDirectory} {
 		if !filepath.IsAbs(directory) {
 			finish()
@@ -105,6 +164,13 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			finish()
 			return report, fmt.Errorf("prepare confined restore state directory: %w", err)
 		}
+	}
+	if marker, pending, err := loadIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State); err != nil {
+		finish()
+		return report, fmt.Errorf("inspect incomplete restore transaction: %w", err)
+	} else if pending {
+		finish()
+		return report, fmt.Errorf("restore recovery is required for incomplete transaction %q (recovery snapshot: %s)", marker.PlanID, marker.RecoveryPath)
 	}
 	available := options.AvailableBytes
 	if available == nil {
@@ -167,11 +233,11 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		return report, errors.New("staged snapshot identity does not match the plan")
 	}
 	preparedPlugins := make(map[string]pluginstore.PreparedPackage)
-	var pluginWorkspace *privateDirectory
+	var pluginWorkspace string
 	filesystemPlugins := 0
 	deckyAPIPlugins := 0
 	for _, action := range options.Plan.PluginActions {
-		if action.Operation == "create" || action.Operation == "replace" {
+		if action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove" {
 			switch action.Method {
 			case pluginMethodFilesystem:
 				filesystemPlugins++
@@ -181,13 +247,12 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		}
 	}
 	if filesystemPlugins > 0 {
-		pluginRoot := filepath.Join(options.Plan.Target.Decky, "plugins")
-		pluginWorkspace, err = createPrivateDirectory(options.Plan.Target.Home, pluginRoot, ".deck-snapshot-plugin-work-")
-		if err != nil {
+		const pluginWorkspaceName = "filesystem-plugin-packages"
+		if err := privateRun.root.Mkdir(pluginWorkspaceName, 0o700); err != nil {
 			finish()
 			return report, err
 		}
-		defer pluginWorkspace.Close()
+		pluginWorkspace = filepath.Join(runDirectory, pluginWorkspaceName)
 	}
 	if deckyAPIPlugins > 0 {
 		if err := privateRun.root.Mkdir("decky-api-packages", 0o700); err != nil {
@@ -208,8 +273,8 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			workspaceName := fmt.Sprintf("package-%04d", index)
 			var workspace string
 			if action.Method == pluginMethodFilesystem {
-				workspace = filepath.Join(pluginWorkspace.Path, workspaceName)
-				if err := pluginWorkspace.root.Mkdir(workspaceName, 0o700); err != nil {
+				workspace = filepath.Join(pluginWorkspace, workspaceName)
+				if err := privateRun.root.Mkdir(filepath.Join("filesystem-plugin-packages", workspaceName), 0o700); err != nil {
 					finish()
 					return report, err
 				}
@@ -232,6 +297,23 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		cleanupStage(runDirectory, stagingDirectory, staged)
 		finish()
 		return report, err
+	}
+	needsRuntimeRefresh := requiresRuntimeRefresh(options.Plan)
+	preRebootBootID := ""
+	if needsRuntimeRefresh {
+		if options.Rebooter == nil {
+			finish()
+			return report, errors.New("restore cannot safely restart this Steam Deck afterward")
+		}
+		if err := options.Rebooter.Preflight(ctx); err != nil {
+			finish()
+			return report, fmt.Errorf("restore cannot safely restart this Steam Deck afterward: %w", err)
+		}
+		preRebootBootID, err = options.Rebooter.BootID(ctx)
+		if err != nil {
+			finish()
+			return report, fmt.Errorf("record pre-restore boot identity: %w", err)
+		}
 	}
 
 	recoveryWorkspace := filepath.Join(runDirectory, "recovery-output")
@@ -261,7 +343,7 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 	report.RecoverySnapshotPath = recovery.Path
 	recoverySelected := make([]string, 0)
 	for _, action := range options.Plan.Actions {
-		if action.Operation == "replace" {
+		if action.Operation == "replace" || action.Operation == "remove" {
 			recoverySelected = append(recoverySelected, action.LogicalPath)
 		}
 	}
@@ -269,7 +351,7 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		recoverySelected = append(recoverySelected, deckyLoaderRecoveryLogicalPath)
 	}
 	for _, action := range options.Plan.PluginActions {
-		if action.Operation != "replace" || action.Method != pluginMethodDeckyAPI {
+		if (action.Operation != "replace" && action.Operation != "remove") || action.Method != pluginMethodDeckyAPI {
 			continue
 		}
 		prefix := "recovery/plugins/" + action.Directory + "/"
@@ -318,6 +400,99 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		finish()
 		return report, err
 	}
+	if needsRuntimeRefresh && options.RuntimeCoordinator == nil {
+		err := errors.New("restore requires a verified Decky runtime refresh coordinator")
+		report.Error = err.Error()
+		finish()
+		_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+		cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+		cleanupStage(runDirectory, stagingDirectory, staged)
+		return report, err
+	}
+	var quiescence Quiescence
+	var quiescer QuiescenceCoordinator
+	var transactionMarker incompleteTransactionMarker
+	if needsRuntimeRefresh {
+		var supported bool
+		quiescer, supported = options.RuntimeCoordinator.(QuiescenceCoordinator)
+		if !supported {
+			err := errors.New("restore requires the supported Decky quiescence coordinator")
+			report.Error = err.Error()
+			finish()
+			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, err
+		}
+		quiescence, err = quiescer.PlanQuiescence(ctx, options.Plan.Target)
+		if err != nil {
+			finish()
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, err
+		}
+		transactionMarker = incompleteTransactionMarker{Schema: 2, PlanID: options.Plan.PlanID, SnapshotID: options.Plan.Snapshot.SnapshotID, SnapshotPath: options.Plan.Snapshot.Path, RecoveryPath: recovery.Path, OriginalPluginInventory: quiescencePluginNames(quiescence.OriginalInventory), OriginalDisabledPlugins: append([]string(nil), quiescence.OriginalDisabled...), TemporaryDisabledPlugins: append([]string(nil), quiescence.TemporaryDisabled...), PreRebootBootID: preRebootBootID, Phase: "prepared"}
+		if err := saveIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+			finish()
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, fmt.Errorf("record incomplete restore transaction: %w", err)
+		}
+		if err := quiescer.Quiesce(ctx, options.Plan.Target, quiescence); err != nil {
+			report.Error = err.Error()
+			cleanupErr := quiescer.RestoreOriginal(context.Background(), options.Plan.Target, quiescence)
+			if cleanupErr != nil {
+				report.Status = "rollback_failed"
+				report.RollbackError = cleanupErr.Error()
+				transactionMarker.Phase = "recovery_required"
+				if markerErr := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); markerErr != nil {
+					report.RollbackError = errors.Join(cleanupErr, fmt.Errorf("record required Decky recovery: %w", markerErr)).Error()
+				}
+			} else {
+				report.Status = "rolled_back"
+				if markerErr := removeIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State); markerErr != nil {
+					report.Status = "rollback_failed"
+					report.RollbackError = markerErr.Error()
+				}
+			}
+			finish()
+			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, err
+		}
+		rollbackQuiescenceOnly := func(failure error) (Report, error) {
+			report.Error = failure.Error()
+			cleanupErr := quiescer.RestoreOriginal(context.Background(), options.Plan.Target, quiescence)
+			if cleanupErr != nil {
+				report.Status = "rollback_failed"
+				report.RollbackError = cleanupErr.Error()
+				transactionMarker.Phase = "recovery_required"
+				if markerErr := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); markerErr != nil {
+					report.RollbackError = errors.Join(cleanupErr, fmt.Errorf("record required Decky recovery: %w", markerErr)).Error()
+				}
+			} else {
+				report.Status = "rolled_back"
+				if markerErr := removeIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State); markerErr != nil {
+					report.Status = "rollback_failed"
+					report.RollbackError = markerErr.Error()
+				}
+			}
+			finish()
+			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, failure
+		}
+		transactionMarker.Phase = "plugins_quiesced"
+		if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+			return rollbackQuiescenceOnly(fmt.Errorf("record Decky quiescence: %w", err))
+		}
+		transactionMarker.Phase = "plugin_convergence"
+		if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+			return rollbackQuiescenceOnly(fmt.Errorf("record plugin convergence: %w", err))
+		}
+	}
 
 	installedPlugins := make([]installedPlugin, 0, len(options.Plan.PluginActions))
 	rollbackPlugins := func() error {
@@ -329,7 +504,36 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		if apiMutation {
 			rollbackErr = errors.Join(rollbackErr, restoreDeckySettingsSideEffects(context.Background(), options.Plan.Target.Home, options.Plan.DeckyLoaderGuard, recoveryStaged, options.Limits))
 		}
+		if needsRuntimeRefresh {
+			rollbackErr = errors.Join(rollbackErr, quiescer.RestoreOriginal(context.Background(), options.Plan.Target, quiescence))
+		}
 		return rollbackErr
+	}
+	failPluginQuiescence := func(failure error) (Report, error) {
+		report.Error = failure.Error()
+		rollbackErr := rollbackPlugins()
+		if revalidateErr := revalidate(context.Background(), options.Plan, options.Limits, options.DeckyInstaller); revalidateErr != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("verify rolled-back target state: %w", revalidateErr))
+		}
+		if rollbackErr != nil {
+			report.Status = "rollback_failed"
+			report.RollbackError = rollbackErr.Error()
+			transactionMarker.Phase = "recovery_required"
+			if markerErr := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); markerErr != nil {
+				report.RollbackError = errors.Join(rollbackErr, fmt.Errorf("record required Decky recovery: %w", markerErr)).Error()
+			}
+		} else {
+			report.Status = "rolled_back"
+			if markerErr := removeIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State); markerErr != nil {
+				report.Status = "rollback_failed"
+				report.RollbackError = markerErr.Error()
+			}
+		}
+		finish()
+		_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+		cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+		cleanupStage(runDirectory, stagingDirectory, staged)
+		return report, failure
 	}
 	for _, action := range options.Plan.PluginActions {
 		result := ActionResult{LogicalPath: "plugin/" + action.Directory, Component: "decky/plugins", Operation: action.Operation}
@@ -342,41 +546,44 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			result.Status = "failed"
 			result.Message = err.Error()
 			report.Actions = append(report.Actions, result)
-			report.Error = err.Error()
-			rollbackErr := rollbackPlugins()
-			if revalidateErr := revalidate(context.Background(), options.Plan, options.Limits, options.DeckyInstaller); revalidateErr != nil {
-				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("verify rolled-back target state: %w", revalidateErr))
-			}
-			if rollbackErr != nil {
-				report.Status = "rollback_failed"
-				report.RollbackError = rollbackErr.Error()
-			} else {
-				report.Status = "rolled_back"
-			}
-			finish()
-			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
-			return report, err
+			return failPluginQuiescence(err)
 		}
 		if options.BeforePlugin != nil {
 			if err := options.BeforePlugin(action); err != nil {
 				result.Status = "failed"
 				result.Message = err.Error()
 				report.Actions = append(report.Actions, result)
-				report.Error = err.Error()
-				rollbackErr := rollbackPlugins()
-				if revalidateErr := revalidate(context.Background(), options.Plan, options.Limits, options.DeckyInstaller); revalidateErr != nil {
-					rollbackErr = errors.Join(rollbackErr, fmt.Errorf("verify rolled-back target state: %w", revalidateErr))
-				}
-				if rollbackErr != nil {
-					report.Status = "rollback_failed"
-					report.RollbackError = rollbackErr.Error()
-				} else {
-					report.Status = "rolled_back"
-				}
-				finish()
-				_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
-				return report, err
+				return failPluginQuiescence(err)
 			}
+		}
+		if action.Operation == "remove" {
+			installed, removeErr := removeDeckyPlugin(ctx, options.DeckyInstaller, action, options.Limits)
+			if removeErr != nil {
+				if installed.MutationStarted {
+					installedPlugins = append(installedPlugins, installed)
+				}
+				result.Status = "failed"
+				result.Message = removeErr.Error()
+				report.Actions = append(report.Actions, result)
+				return failPluginQuiescence(removeErr)
+			}
+			installedPlugins = append(installedPlugins, installed)
+			if needsRuntimeRefresh {
+				expected := quiescencePluginNames(quiescence.Inventory)
+				expected = removePluginName(expected, action.ExistingName)
+				if err := quiescer.SynchronizeQuiescence(ctx, &quiescence, expected); err != nil {
+					return failPluginQuiescence(err)
+				}
+				quiescence.Inventory = removePluginStatus(quiescence.Inventory, action.ExistingName)
+				transactionMarker.TemporaryDisabledPlugins = append([]string(nil), quiescence.TemporaryDisabled...)
+				if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+					return failPluginQuiescence(fmt.Errorf("record synchronized Decky quiescence: %w", err))
+				}
+			}
+			result.Status = "applied"
+			result.Message = "Extra plugin removed through Decky Loader and retained in the validated recovery snapshot."
+			report.Actions = append(report.Actions, result)
+			continue
 		}
 		prepared, exists := preparedPlugins[action.Directory]
 		if !exists {
@@ -384,8 +591,7 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			result.Status = "failed"
 			result.Message = err.Error()
 			report.Actions = append(report.Actions, result)
-			finish()
-			return report, err
+			return failPluginQuiescence(err)
 		}
 		resolution, resolved := resolutionForDirectory(options.Plan.Plugins, action.Directory)
 		if !resolved {
@@ -393,8 +599,12 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			result.Status = "failed"
 			result.Message = err.Error()
 			report.Actions = append(report.Actions, result)
-			finish()
-			return report, err
+			return failPluginQuiescence(err)
+		}
+		if needsRuntimeRefresh && action.Method == pluginMethodDeckyAPI {
+			if err := quiescer.KeepDisabled(ctx, &quiescence, resolution.StoreName); err != nil {
+				return failPluginQuiescence(err)
+			}
 		}
 		var installed installedPlugin
 		if action.Method == pluginMethodDeckyAPI {
@@ -402,16 +612,11 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		} else {
 			installed, err = installPreparedPlugin(options.Plan.Target.Home, action, prepared, options.Limits)
 		}
-		if action.Method == pluginMethodDeckyAPI && installed.MutationStarted {
-			if sideEffectErr := restoreDeckySettingsSideEffects(context.Background(), options.Plan.Target.Home, options.Plan.DeckyLoaderGuard, recoveryStaged, options.Limits); sideEffectErr != nil {
-				err = errors.Join(err, fmt.Errorf("restore Decky Loader settings after bounded plugin operation: %w", sideEffectErr))
-			}
-		}
 		if err != nil {
 			var incomplete *incompleteMutationError
-			if action.Method == pluginMethodFilesystem && pluginWorkspace != nil && errors.As(err, &incomplete) {
-				pluginWorkspace.Retain()
-				err = &incompleteMutationError{err: errors.Join(err, fmt.Errorf("retained plugin workspace at %s", pluginWorkspace.Path))}
+			if action.Method == pluginMethodFilesystem && pluginWorkspace != "" && errors.As(err, &incomplete) {
+				privateRun.Retain()
+				err = &incompleteMutationError{err: errors.Join(err, fmt.Errorf("retained plugin workspace at %s", pluginWorkspace))}
 			}
 			if installed.MutationStarted {
 				installedPlugins = append(installedPlugins, installed)
@@ -419,22 +624,24 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			result.Status = "failed"
 			result.Message = err.Error()
 			report.Actions = append(report.Actions, result)
-			report.Error = err.Error()
-			rollbackErr := rollbackPlugins()
-			if revalidateErr := revalidate(context.Background(), options.Plan, options.Limits, options.DeckyInstaller); revalidateErr != nil {
-				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("verify rolled-back target state: %w", revalidateErr))
-			}
-			if rollbackErr != nil {
-				report.Status = "rollback_failed"
-				report.RollbackError = rollbackErr.Error()
-			} else {
-				report.Status = "rolled_back"
-			}
-			finish()
-			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
-			return report, err
+			return failPluginQuiescence(err)
 		}
 		installedPlugins = append(installedPlugins, installed)
+		if needsRuntimeRefresh && action.Method == pluginMethodDeckyAPI {
+			expected := quiescencePluginNames(quiescence.Inventory)
+			if action.Operation == "replace" {
+				expected = removePluginName(expected, action.ExistingName)
+			}
+			expected = append(expected, resolution.StoreName)
+			if err := quiescer.SynchronizeQuiescence(ctx, &quiescence, expected); err != nil {
+				return failPluginQuiescence(err)
+			}
+			quiescence.Inventory = replacePluginStatus(quiescence.Inventory, action.ExistingName, resolution.StoreName, resolution.ResolvedVersion)
+			transactionMarker.TemporaryDisabledPlugins = append([]string(nil), quiescence.TemporaryDisabled...)
+			if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+				return failPluginQuiescence(fmt.Errorf("record synchronized Decky quiescence: %w", err))
+			}
+		}
 		result.Status = "applied"
 		if action.Operation == "replace" {
 			if action.Method == pluginMethodDeckyAPI {
@@ -444,6 +651,33 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			}
 		}
 		report.Actions = append(report.Actions, result)
+	}
+	if needsRuntimeRefresh {
+		// Decky's API mutations may have changed loader.json. Restore the exact
+		// guarded pre-transaction file only after all bounded API operations; the
+		// running plugin wrappers stay disabled until the final controlled refresh.
+		if err := restoreDeckySettingsSideEffects(context.Background(), options.Plan.Target.Home, options.Plan.DeckyLoaderGuard, recoveryStaged, options.Limits); err != nil {
+			return failPluginQuiescence(err)
+		}
+	}
+	if planMutatesSteam(options.Plan) {
+		steam, supported := options.RuntimeCoordinator.(SteamQuiescer)
+		if !supported {
+			return failPluginQuiescence(errors.New("restore requires a verified Steam quiescence coordinator before artwork changes"))
+		}
+		if err := steam.QuiesceSteam(ctx); err != nil {
+			return failPluginQuiescence(fmt.Errorf("quiesce Steam before artwork convergence: %w", err))
+		}
+		transactionMarker.Phase = "steam_quiesced"
+		if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+			return failPluginQuiescence(fmt.Errorf("record Steam quiescence: %w", err))
+		}
+	}
+	if needsRuntimeRefresh {
+		transactionMarker.Phase = "filesystem_convergence"
+		if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+			return failPluginQuiescence(fmt.Errorf("record filesystem convergence: %w", err))
+		}
 	}
 
 	applied := make([]Action, 0, len(options.Plan.Actions))
@@ -470,6 +704,27 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 				applyErr = err
 				break
 			}
+		}
+		if action.Operation == "remove" {
+			if err := removeAppliedCreate(options.Plan.Target.Home, action); err != nil {
+				applyErr = fmt.Errorf("remove %q: %w", action.LogicalPath, err)
+				result.Status = "failed"
+				result.Message = applyErr.Error()
+				report.Actions = append(report.Actions, result)
+				break
+			}
+			if _, err := os.Lstat(action.TargetPath); !errors.Is(err, os.ErrNotExist) {
+				applyErr = fmt.Errorf("verify removal %q: target remains present", action.LogicalPath)
+				result.Status = "failed"
+				result.Message = applyErr.Error()
+				report.Actions = append(report.Actions, result)
+				applied = append(applied, action)
+				break
+			}
+			applied = append(applied, action)
+			result.Status = "applied"
+			report.Actions = append(report.Actions, result)
+			continue
 		}
 		payload, exists := staged[action.LogicalPath]
 		if !exists {
@@ -540,11 +795,43 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 			report.Actions = append(report.Actions, result)
 		}
 	}
+	if applyErr == nil {
+		if err := verifyConverged(ctx, options.Plan, options.Limits, options.DeckyInstaller); err != nil {
+			applyErr = fmt.Errorf("verify static converged restore state: %w", err)
+		}
+		if applyErr == nil && needsRuntimeRefresh {
+			transactionMarker.Phase = "static_verification_passed"
+			if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+				applyErr = fmt.Errorf("record static restore verification: %w", err)
+			}
+		}
+	}
+	if applyErr == nil && needsRuntimeRefresh {
+		transactionMarker.Phase = "awaiting_reboot"
+		if err := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); err != nil {
+			applyErr = fmt.Errorf("record pending reboot: %w", err)
+		} else if err := options.Rebooter.Request(ctx); err != nil {
+			report.Status = "reboot_required"
+			report.Error = "Your customization was restored, but the Steam Deck still needs to restart to finish applying it."
+			finish()
+			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, err
+		} else {
+			report.Status = "awaiting_post_boot_verification"
+			finish()
+			_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+			cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
+			cleanupStage(runDirectory, stagingDirectory, staged)
+			return report, nil
+		}
+	}
 
 	if applyErr != nil {
 		report.Error = applyErr.Error()
-		pluginRollbackErr := rollbackPlugins()
 		fileRollbackErr := rollbackApplied(options.Plan.Target.Home, applied, recoveryStaged)
+		pluginRollbackErr := rollbackPlugins()
 		rollbackErr := errors.Join(fileRollbackErr, pluginRollbackErr)
 		if revalidateErr := revalidate(context.Background(), options.Plan, options.Limits, options.DeckyInstaller); revalidateErr != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("verify rolled-back target state: %w", revalidateErr))
@@ -552,8 +839,18 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 		if rollbackErr != nil {
 			report.Status = "rollback_failed"
 			report.RollbackError = rollbackErr.Error()
+			if needsRuntimeRefresh {
+				transactionMarker.Phase = "recovery_required"
+				if markerErr := updateIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State, transactionMarker); markerErr != nil {
+					report.RollbackError = errors.Join(rollbackErr, fmt.Errorf("record required Decky recovery: %w", markerErr)).Error()
+				}
+			}
 		} else {
 			report.Status = "rolled_back"
+			if markerErr := removeIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State); markerErr != nil {
+				report.Status = "rollback_failed"
+				report.RollbackError = markerErr.Error()
+			}
 		}
 		finish()
 		_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
@@ -563,6 +860,13 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 	}
 
 	report.Status = "succeeded"
+	if err := removeIncompleteTransaction(options.Plan.Target.Home, options.Plan.Target.State); err != nil {
+		report.Status = "succeeded_marker_retained"
+		report.Error = err.Error()
+		finish()
+		_ = saveReport(options.Plan.Target.Home, options.ReportDirectory, &report)
+		return report, err
+	}
 	finish()
 	if err := saveReport(options.Plan.Target.Home, options.ReportDirectory, &report); err != nil {
 		report.Status = "succeeded_report_failed"
@@ -574,6 +878,14 @@ func Run(ctx context.Context, options RunOptions) (Report, error) {
 	cleanupStage(runDirectory, recoveryStageDirectory, recoveryStaged)
 	cleanupStage(runDirectory, stagingDirectory, staged)
 	return report, nil
+}
+func planMutatesSteam(plan Plan) bool {
+	for _, action := range plan.Actions {
+		if action.Component == "steam" && (action.Operation == "create" || action.Operation == "replace" || action.Operation == "remove") {
+			return true
+		}
+	}
+	return false
 }
 
 func rollbackApplied(home string, applied []Action, recovery map[string]snapshot.StagedFile) error {
@@ -599,6 +911,20 @@ func rollbackApplied(home string, applied []Action, recovery map[string]snapshot
 			rollbackAction.ExistingMode = action.DesiredMode
 			if err := atomicWrite(context.Background(), home, rollbackAction, payload.Path, os.FileMode(action.ExistingMode), "replace"); err != nil {
 				failures = append(failures, fmt.Errorf("restore recovery payload %q: %w", action.LogicalPath, err))
+			}
+		case "remove":
+			payload, exists := recovery[action.LogicalPath]
+			if !exists {
+				failures = append(failures, fmt.Errorf("recovery payload is missing for removed target %q", action.LogicalPath))
+				continue
+			}
+			rollbackAction := action
+			rollbackAction.Operation = "create"
+			rollbackAction.ExistingSize = 0
+			rollbackAction.ExistingSHA256 = ""
+			rollbackAction.ExistingMode = 0
+			if err := atomicWrite(context.Background(), home, rollbackAction, payload.Path, os.FileMode(action.ExistingMode), "create"); err != nil {
+				failures = append(failures, fmt.Errorf("restore removed recovery payload %q: %w", action.LogicalPath, err))
 			}
 		}
 	}

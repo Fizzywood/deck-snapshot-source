@@ -24,13 +24,14 @@ func restoreDeckySettingsSideEffects(ctx context.Context, home string, guard *Lo
 			return nil
 		}
 		dynamic := Action{
-			LogicalPath: deckyLoaderRecoveryLogicalPath,
-			TargetRoot:  guard.TargetRoot,
-			TargetPath:  guard.TargetPath,
-			Operation:   "create",
-			Size:        size,
-			SHA256:      checksum,
-			DesiredMode: mode,
+			LogicalPath:  deckyLoaderRecoveryLogicalPath,
+			TargetRoot:   guard.TargetRoot,
+			TargetPath:   guard.TargetPath,
+			Operation:    "create",
+			Size:         size,
+			SHA256:       checksum,
+			DesiredMode:  mode,
+			ExistingMode: mode,
 		}
 		if err := removeAppliedCreate(home, dynamic); err != nil {
 			return fmt.Errorf("remove Decky Loader settings side effect: %w", err)

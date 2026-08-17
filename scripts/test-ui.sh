@@ -110,12 +110,16 @@ if [[ "$*" == "update install" && "${UI_SCENARIO:-}" == update_available ]]; the
   printf 'Installed: v0.1.3\nAvailable: v0.1.4\nUpdate installed: true\n'
   exit 0
 fi
-if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore)$ && "$*" == "restore plan $SNAPSHOT_FILE" ]]; then
+if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore|snapshot_noop)$ && "$*" == "restore plan $SNAPSHOT_FILE" ]]; then
   printf 'Restore plan created without target writes: %s\nPlan ID: restore-aaaaaaaaaaaaaaaa\nApproval hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nActions: 1\nPlugins: 0\nBlocking: false\nRequired free space: 1 bytes\n' "$TEST_PLAN_FILE"
   exit 0
 fi
-if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore)$ && "$*" == "restore inspect --details $TEST_PLAN_FILE" ]]; then
-  printf 'Plan ID: restore-aaaaaaaaaaaaaaaa\nFile action: unchanged | steam | fixture -> synthetic-target\n'
+if [[ "${UI_SCENARIO:-}" =~ ^(restore|snapshot_restore|snapshot_noop)$ && "$*" == "restore inspect --details $TEST_PLAN_FILE" ]]; then
+  if [[ "${UI_SCENARIO:-}" == snapshot_noop ]]; then
+    printf 'Plan ID: restore-aaaaaaaaaaaaaaaa\nFile action: unchanged | steam | fixture -> synthetic-target\n'
+  else
+    printf 'Plan ID: restore-aaaaaaaaaaaaaaaa\nPlugin action: remove | Alarm Me -> synthetic-plugin\nFile action: create | css-loader | css-loader/themes/BPM/theme.json -> synthetic-css\nFile action: replace | steam | steam/artwork/userdata/1/grid/100.png -> synthetic-artwork\n'
+  fi
   exit 0
 fi
 printf 'Synthetic core success.\n'
@@ -167,6 +171,14 @@ if [[ " $* " == *' --menu '* ]]; then
       *) printf 'quit\n' ;;
     esac
   elif [[ "$UI_SCENARIO" == snapshot_restore ]]; then
+    case "$count" in
+      1) printf 'snapshots\n' ;;
+      2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
+      3) printf 'restore\n' ;;
+      4) printf 'restore\n' ;;
+      *) printf 'quit\n' ;;
+    esac
+  elif [[ "$UI_SCENARIO" == snapshot_noop ]]; then
     case "$count" in
       1) printf 'snapshots\n' ;;
       2) printf 'local:%s\n' "${SNAPSHOT_FILE##*/}" ;;
@@ -555,8 +567,27 @@ test "$(grep -Fc "snapshot inspect --details $SNAPSHOT_FILE" "$TEST_LOG")" -eq 1
 grep -Fx "restore plan $SNAPSHOT_FILE" "$TEST_LOG" >/dev/null
 grep -Fx "restore inspect --details $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
 grep -Fx "restore run --approve restore-aaaaaaaaaaaaaaaa --approval-hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $TEST_PLAN_FILE" "$TEST_LOG" >/dev/null
+grep -F 'Deck Snapshot will return your supported customization to this backup.' "$KDIALOG_LOG" >/dev/null
+grep -F 'Remove 1 plugins added after this backup' "$KDIALOG_LOG" >/dev/null
+grep -F 'Restore 1 CSS Loader themes and settings' "$KDIALOG_LOG" >/dev/null
+grep -F 'A safety backup will be created first.' "$KDIALOG_LOG" >/dev/null
+if grep -F -e 'Approval hash:' -e 'Plan ID:' -e "$TEST_PLAN_FILE" "$KDIALOG_LOG" >/dev/null; then
+  printf 'Normal restore UI exposed technical plan identifiers or paths.\n' >&2
+  exit 1
+fi
 if grep -F 'Deck Snapshot — Restore' "$KDIALOG_LOG" >/dev/null; then
   printf 'Snapshot restore unexpectedly opened a second snapshot chooser.\n' >&2
+  exit 1
+fi
+
+: >"$TEST_LOG"
+: >"$KDIALOG_LOG"
+rm -f -- "$MENU_COUNT" "$FILE_COUNT" "$PASSWORD_COUNT"
+export UI_SCENARIO=snapshot_noop
+"$APP_DIR/deck-snapshot-ui"
+grep -F 'This Steam Deck already matches this backup.' "$KDIALOG_LOG" >/dev/null
+if grep -F 'restore run ' "$TEST_LOG" >/dev/null; then
+  printf 'No-op restore started a transaction.\n' >&2
   exit 1
 fi
 

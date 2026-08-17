@@ -8,15 +8,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Fizzywood/deck-snapshot/internal/logging"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
@@ -37,6 +40,35 @@ type Installer interface {
 	Probe(context.Context, string) error
 	Install(context.Context, InstallRequest) error
 	Uninstall(context.Context, string) error
+}
+
+// PluginStatus is the small, version-bounded part of Decky's inventory that
+// the restore coordinator needs in order to prove plugin backends are not
+// running. It deliberately exposes neither plugin paths nor arbitrary plugin
+// methods.
+type PluginStatus struct {
+	Name     string
+	Version  string
+	Disabled bool
+}
+
+// Controller is the complete fixed Decky v3.2.6 restore boundary.  Every
+// implementation must reject arbitrary routes, settings keys, plugin method
+// calls and process-control requests.
+type Controller interface {
+	Installer
+	Restarter
+	Inventory(context.Context) ([]PluginStatus, error)
+	DisabledPlugins(context.Context) ([]string, error)
+	SetDisabledPlugins(context.Context, []string) error
+}
+
+// Restarter is the narrow, version-bounded runtime refresh boundary used after
+// Deck Snapshot has changed supported Decky- or CSS-owned state. It is kept
+// separate from Installer so planning remains read-only and callers cannot
+// accidentally treat an installation capability as a process-control grant.
+type Restarter interface {
+	Restart(context.Context, string) error
 }
 
 // InstallRequest identifies one already-downloaded and checksum-verified ZIP.
@@ -194,6 +226,187 @@ func (client *Client) Uninstall(ctx context.Context, name string) error {
 		return err
 	}
 	return nil
+}
+
+// Inventory obtains Decky's own bounded plugin status list. It is used only
+// for exact quiescence and post-mutation verification.
+func (client *Client) Inventory(ctx context.Context) ([]PluginStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	connection, err := client.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.CloseNow()
+	result, err := call(ctx, connection, 1, "loader/get_plugins", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var values []PluginStatus
+	if err := json.Unmarshal(result, &values); err != nil || len(values) > 512 {
+		return nil, errors.New("Decky Loader returned an invalid plugin inventory")
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !validField(value.Name, 1, 128) || !validField(value.Version, 0, 128) {
+			return nil, errors.New("Decky Loader returned an unsafe plugin inventory value")
+		}
+		if _, duplicate := seen[value.Name]; duplicate {
+			return nil, errors.New("Decky Loader returned a duplicate plugin identity")
+		}
+		seen[value.Name] = struct{}{}
+	}
+	return values, nil
+}
+
+// DisabledPlugins reads only Decky's fixed disabled_plugins setting. The
+// restore coordinator never exposes a caller-selected settings key.
+func (client *Client) DisabledPlugins(ctx context.Context) ([]string, error) {
+	return client.pluginListSetting(ctx, "utilities/settings/get", nil)
+}
+
+// SetDisabledPlugins changes only the fixed disabled_plugins setting. Names
+// are strict bounded plugin display identities; callers provide an exact set.
+func (client *Client) SetDisabledPlugins(ctx context.Context, names []string) error {
+	values, err := normalizePluginNames(names)
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	connection, err := client.connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer connection.CloseNow()
+	result, err := call(ctx, connection, 1, "utilities/settings/set", []any{"disabled_plugins", values}, nil)
+	if err != nil {
+		return err
+	}
+	var accepted any
+	if err := json.Unmarshal(result, &accepted); err != nil {
+		return errors.New("Decky Loader returned an invalid disabled-plugin acknowledgement")
+	}
+	actual, err := client.DisabledPlugins(ctx)
+	if err != nil || !samePluginNames(values, actual) {
+		return errors.New("Decky Loader did not persist the exact disabled-plugin state")
+	}
+	return nil
+}
+
+func (client *Client) pluginListSetting(ctx context.Context, route string, arguments []any) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	connection, err := client.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.CloseNow()
+	if arguments == nil {
+		arguments = []any{"disabled_plugins", []string{}}
+		// Decky's getter accepts the fixed key plus its typed default.
+	}
+	result, err := call(ctx, connection, 1, route, arguments, nil)
+	if err != nil {
+		return nil, err
+	}
+	var values []string
+	if err := json.Unmarshal(result, &values); err != nil {
+		return nil, errors.New("Decky Loader returned an invalid disabled-plugin state")
+	}
+	return normalizePluginNames(values)
+}
+
+func normalizePluginNames(names []string) ([]string, error) {
+	if len(names) > 512 {
+		return nil, errors.New("Decky Loader disabled-plugin state exceeds the limit")
+	}
+	seen := make(map[string]struct{}, len(names))
+	values := make([]string, 0, len(names))
+	for _, name := range names {
+		if !validField(name, 1, 128) {
+			return nil, errors.New("Decky Loader plugin identity is unsafe")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, errors.New("Decky Loader disabled-plugin state contains duplicates")
+		}
+		seen[name] = struct{}{}
+		values = append(values, name)
+	}
+	sort.Strings(values)
+	return values, nil
+}
+
+func samePluginNames(first, second []string) bool {
+	first, firstErr := normalizePluginNames(first)
+	second, secondErr := normalizePluginNames(second)
+	if firstErr != nil || secondErr != nil || len(first) != len(second) {
+		return false
+	}
+	for index := range first {
+		if first[index] != second[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// Restart asks the supported Decky Loader service to perform its own bounded
+// restart, proves that the old loopback service went away and a supported
+// replacement came back, then asks that same supported service to reload
+// Steam's web helper. It never executes systemctl or a shell command itself.
+func (client *Client) Restart(ctx context.Context, deckyHome string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateDeckyVersion(deckyHome); err != nil {
+		return err
+	}
+	connection, err := client.connect(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := call(ctx, connection, 1, "updater/do_restart", nil, nil); err != nil {
+		connection.CloseNow()
+		return err
+	}
+	connection.CloseNow()
+
+	deadline := time.NewTimer(45 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	seenOffline := false
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Decky Loader restart: %w", ctx.Err())
+		case <-deadline.C:
+			return errors.New("Decky Loader restart was not observed safely")
+		case <-ticker.C:
+			probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+			err := client.Probe(probeCtx, deckyHome)
+			cancel()
+			if err != nil {
+				seenOffline = true
+				continue
+			}
+			if seenOffline {
+				connection, err := client.connect(ctx)
+				if err != nil {
+					return errors.New("Decky Loader replacement could not be reconnected")
+				}
+				defer connection.CloseNow()
+				if _, err := call(ctx, connection, 1, "utilities/restart_webhelper", nil, nil); err != nil {
+					return errors.New("Decky Loader could not reload the Steam web helper")
+				}
+				return nil
+			}
+		}
+	}
 }
 
 func validateDeckyVersion(deckyHome string) error {
@@ -365,7 +578,7 @@ type inboundMessage struct {
 func call(ctx context.Context, connection *websocket.Conn, id int, route string, arguments []any, onEvent func(inboundMessage) error) (json.RawMessage, error) {
 	callCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	if err := wsjson.Write(callCtx, connection, outboundCall{Type: 0, ID: id, Route: route, Args: arguments}); err != nil {
+	if err := wsjson.Write(callCtx, connection, outboundCall{Type: 0, ID: id, Route: route, Args: normalizeCallArguments(arguments)}); err != nil {
 		return nil, errors.New("write Decky Loader request")
 	}
 	for count := 0; count < maxMessagesPerCall; count++ {
@@ -377,6 +590,9 @@ func call(ctx context.Context, connection *websocket.Conn, id int, route string,
 		case -1:
 			if message.ID != id {
 				return nil, errors.New("Decky Loader returned an unrelated error response")
+			}
+			if detail := boundedDeckyError(message.Error); detail != "" {
+				return nil, fmt.Errorf("Decky Loader rejected the bounded request: %s", detail)
 			}
 			return nil, errors.New("Decky Loader rejected the bounded request")
 		case 1:
@@ -393,6 +609,55 @@ func call(ctx context.Context, connection *websocket.Conn, id int, route string,
 		}
 	}
 	return nil, errors.New("Decky Loader response exceeded the message limit")
+}
+
+func normalizeCallArguments(arguments []any) []any {
+	if arguments == nil {
+		return []any{}
+	}
+	return arguments
+}
+
+type deckyError struct {
+	Name    string `json:"name"`
+	Message string `json:"message"`
+}
+
+func boundedDeckyError(raw json.RawMessage) string {
+	if len(raw) == 0 || len(raw) > 512 {
+		return ""
+	}
+	var value deckyError
+	if json.Unmarshal(raw, &value) != nil || !validDeckyErrorName(value.Name) || !validDeckyErrorMessage(value.Message) {
+		return ""
+	}
+	return value.Name + ": " + logging.RedactText(value.Message)
+}
+
+func validDeckyErrorName(value string) bool {
+	if !validField(value, 1, 64) {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || character == '_' || (index > 0 && ((character >= '0' && character <= '9') || character == '.')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validDeckyErrorMessage(value string) bool {
+	if !validField(value, 1, 192) {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, sensitive := range []string{"token", "secret", "password", "authorization", "credential", "api key", "http://", "https://"} {
+		if strings.Contains(lower, sensitive) {
+			return false
+		}
+	}
+	return true
 }
 
 type promptValues struct {

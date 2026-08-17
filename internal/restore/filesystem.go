@@ -380,15 +380,19 @@ func removeAppliedCreate(home string, action Action) (resultErr error) {
 		return err
 	}
 	defer parent.root.Close()
-	exists, size, hash, _, err := inspectParentFile(parent, action.Size)
+	exists, size, hash, mode, err := inspectParentFile(parent, action.Size)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return nil
 	}
-	if size != action.Size || hash != action.SHA256 {
-		return errors.New("created target changed before rollback")
+	expectedMode := action.ExistingMode
+	if expectedMode == 0 {
+		expectedMode = action.DesiredMode
+	}
+	if size != action.Size || hash != action.SHA256 || mode != expectedMode {
+		return errors.New("removal target changed after approval")
 	}
 	transaction, err := createPrivateDirectory(home, filepath.Dir(action.TargetPath), ".deck-snapshot-file-rollback-")
 	if err != nil {

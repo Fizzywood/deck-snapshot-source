@@ -38,7 +38,7 @@ func createRecoveryPluginPackages(ctx context.Context, directory string, plan Pl
 	packages := make(map[string]recoveryPluginPackage)
 	packageIndex := 0
 	for _, action := range plan.PluginActions {
-		if action.Operation != "replace" || action.Method != pluginMethodDeckyAPI {
+		if (action.Operation != "replace" && action.Operation != "remove") || action.Method != pluginMethodDeckyAPI {
 			continue
 		}
 		prefix := "recovery/plugins/" + action.Directory + "/"

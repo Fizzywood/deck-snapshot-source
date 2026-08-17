@@ -93,7 +93,7 @@ type restorePlanResponse struct {
 
 func runRestore(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "Usage error: restore requires plan, inspect, or run.")
+		fmt.Fprintln(stderr, "Usage error: restore requires plan, inspect, reboot-check, or run.")
 		return ExitUsage
 	}
 	switch args[0] {
@@ -101,12 +101,58 @@ func runRestore(args []string, stdout, stderr io.Writer, dependencies Dependenci
 		return runRestorePlan(args[1:], stdout, stderr, dependencies)
 	case "inspect":
 		return runRestoreInspect(args[1:], stdout, stderr)
+	case "reboot-check":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "Usage error: restore reboot-check takes no arguments.")
+			return ExitUsage
+		}
+		if err := restore.NewSessionRebooter().Preflight(context.Background()); err != nil {
+			fmt.Fprintf(stderr, "Restore reboot check failed: %v\n", err)
+			return ExitRuntime
+		}
+		fmt.Fprintln(stdout, "Restore reboot ready.")
+		return ExitOK
+	case "pending":
+		return runRestorePending(args[1:], stdout, stderr, dependencies)
+	case "reboot":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "Usage error: restore reboot takes no arguments.")
+			return ExitUsage
+		}
+		if err := restore.NewSessionRebooter().Request(context.Background()); err != nil {
+			fmt.Fprintf(stderr, "Restore reboot failed: %v\n", err)
+			return ExitRuntime
+		}
+		fmt.Fprintln(stdout, "Restore reboot requested.")
+		return ExitOK
 	case "run":
 		return runRestoreRun(args[1:], stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "Usage error: unknown restore subcommand %q.\n", args[0])
 		return ExitUsage
 	}
+}
+
+func runRestorePending(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "Usage error: restore pending takes no arguments.")
+		return ExitUsage
+	}
+	paths, code := resolveSnapshotPaths(dependencies.Environment, "", "", "", "", stderr)
+	if code != ExitOK {
+		return code
+	}
+	resolver := dependencies.Resolver
+	if resolver == nil {
+		resolver = pluginstore.NewOfficial()
+	}
+	state, err := restore.CheckPendingRestore(context.Background(), paths, dependencies.Version, resolver, deckyapi.New(), restore.NewSessionRebooter())
+	if err != nil {
+		fmt.Fprintf(stderr, "Pending restore needs attention: %v\n", err)
+		return ExitRuntime
+	}
+	fmt.Fprintf(stdout, "Pending restore: %s\n", state)
+	return ExitOK
 }
 
 func runRestorePlan(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
@@ -280,7 +326,7 @@ func runRestoreRun(args []string, stdout, stderr io.Writer, dependencies Depende
 	report, runErr := restore.Run(context.Background(), restore.RunOptions{
 		Plan: plan, ApprovedPlanID: *approvedPlanID, ApprovedHash: *approvedHash, Limits: limits.Default(),
 		WorkDirectory: filepath.Join(plan.Target.State, "work"), RecoveryDirectory: filepath.Join(plan.Target.State, "recovery"), ReportDirectory: filepath.Join(plan.Target.State, "reports"),
-		Now: dependencies.Now, HTTPClient: dependencies.HTTPClient, DeckyInstaller: deckyInstaller(dependencies),
+		Now: dependencies.Now, HTTPClient: dependencies.HTTPClient, DeckyInstaller: deckyInstaller(dependencies), RuntimeCoordinator: restore.NewDeckyRuntimeCoordinator(deckyapi.New()), Rebooter: restore.NewSessionRebooter(),
 	})
 	if *jsonOutput {
 		if err := writeJSON(stdout, report); err != nil {

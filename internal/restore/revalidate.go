@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"time"
 
 	"github.com/Fizzywood/deck-snapshot/internal/deckyapi"
 	"github.com/Fizzywood/deck-snapshot/internal/limits"
@@ -54,6 +56,11 @@ func revalidate(ctx context.Context, plan Plan, resourceLimits limits.Limits, in
 		}
 		current = append(current, action)
 	}
+	convergence, err := buildConvergenceActions(ctx, paths, value, plan.AppVersion, time.Now(), resourceLimits)
+	if err != nil {
+		return fmt.Errorf("rebuild convergence target fingerprint: %w", err)
+	}
+	current = append(current, convergence...)
 	currentPlugins, err := buildPluginActions(ctx, paths, plan.Snapshot.SnapshotID, plan.Plugins, resourceLimits, installer)
 	if err != nil {
 		return err
@@ -63,6 +70,7 @@ func revalidate(ctx context.Context, plan Plan, resourceLimits limits.Limits, in
 	current = currentPlan.Actions
 	currentPlugins = currentPlan.PluginActions
 	current, currentPreserved := splitIncompatibleSettings(paths, plan.Snapshot.SnapshotID, plan.Plugins, current)
+	sort.Slice(current, func(i, j int) bool { return current[i].LogicalPath < current[j].LogicalPath })
 	if fingerprintTargets(current, currentPlugins, currentPreserved, currentPlan.DeckyLoaderGuard) != plan.TargetFingerprint {
 		return errors.New("restore targets changed after the plan was approved")
 	}

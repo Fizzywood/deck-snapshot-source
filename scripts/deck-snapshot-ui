@@ -758,7 +758,7 @@ snapshot_requires_decky() {
 }
 
 plan_restore_path() {
-  local snapshot snapshot_details output plan_path plan_id approval_hash run_output details_output
+  local snapshot snapshot_details output plan_path plan_id approval_hash run_output details_output choice summary
   snapshot=$1
   if (( $# >= 2 )); then
     snapshot_details=$2
@@ -777,7 +777,6 @@ plan_restore_path() {
     fi
     return
   fi
-  show_output "Restore dry-run plan" "$output"
   plan_path=$(printf '%s\n' "$output" | sed -n 's/^Restore plan created without target writes: //p' | head -n 1)
   plan_id=$(printf '%s\n' "$output" | sed -n 's/^Plan ID: //p' | head -n 1)
   approval_hash=$(printf '%s\n' "$output" | sed -n 's/^Approval hash: //p' | head -n 1)
@@ -786,27 +785,76 @@ plan_restore_path() {
     return
   fi
   if printf '%s\n' "$output" | grep -Fx 'Blocking: true' >/dev/null; then
-    show_error "This restore plan is blocked. No restore can be started until every blocking item is resolved."
-    return
-  fi
-  if "$KDIALOG" --title "Review exact restore actions" --yesno "View every planned file and plugin action before deciding?"; then
-    if ! details_output=$("$CLI" restore inspect --details "$plan_path" 2>&1); then
-      show_error "The saved plan could not be reloaded safely. No restore was started."
-      return
+    if "$KDIALOG" --title "Restore can’t continue safely" --yesno "Deck Snapshot could not prepare this restore safely. No production files were changed.\n\nView technical details?"; then
+      show_output "Restore technical details" "$output"
     fi
-    show_output "Exact restore actions" "$details_output"
-  fi
-  if ! "$KDIALOG" --title "Confirm exact restore" --warningyesno "Run exact plan $plan_id?\n\nApproval SHA-256:\n$approval_hash\n\nA verified recovery snapshot is created before any production change."; then
     return
   fi
-  "$KDIALOG" --title "Deck Snapshot" --passivepopup "Running the approved restore transaction..." 4
+  if ! details_output=$("$CLI" restore inspect --details "$plan_path" 2>&1); then
+    show_error "The saved restore preparation could not be reloaded safely. No restore was started."
+    return
+  fi
+  if ! "$CLI" restore reboot-check >/dev/null 2>&1; then
+    show_error "Restore can’t start because Deck Snapshot cannot safely restart this Steam Deck afterward."
+    return
+  fi
+  if ! printf '%s\n' "$details_output" | grep -Eq '^(File|Plugin) action: (create|replace|remove) \|'; then
+    show_output "Already restored" "This Steam Deck already matches this backup.\n\nNo restore transaction is needed."
+    return
+  fi
+  summary=$(restore_plan_summary "$details_output")
+  summary+=$'\n\nA safety backup will be created first.\nYour Steam Deck will restart when the restore is finished.'
+  while true; do
+    choice=$("$KDIALOG" --title "Ready to restore" --menu "$summary" restore "Restore" cancel "Cancel" technical "Technical details") || return
+    case "$choice" in
+      restore) break ;;
+      technical) show_output "Restore technical details" "$details_output" ;;
+      *) return ;;
+    esac
+  done
+  "$KDIALOG" --title "Deck Snapshot" --passivepopup "Preparing safety backup…" 3
   if run_output=$("$CLI" restore run --approve "$plan_id" --approval-hash "$approval_hash" "$plan_path" 2>&1); then
-    show_output "Restore completed" "$run_output"
+    if printf '%s\n' "$run_output" | grep -F 'Restore status: already_matches' >/dev/null; then
+      show_output "Already restored" "This Steam Deck already matches this backup."
+    elif printf '%s\n' "$run_output" | grep -F 'Restore status: awaiting_post_boot_verification' >/dev/null; then
+      show_output "Finishing restore" "Deck Snapshot is restarting the Steam Deck. It will verify the restored setup after the next boot."
+    elif printf '%s\n' "$run_output" | grep -F 'Restore status: reboot_required' >/dev/null; then
+      show_output "Restart required" "Your customization was restored, but the Steam Deck still needs to restart to finish applying it."
+    else
+      "$KDIALOG" --title "Deck Snapshot" --passivepopup "Refreshing Decky and Steam…" 3
+      show_output "Restore complete" "Your saved customization has been restored."
+    fi
   else
     if "$KDIALOG" --title "Restore did not complete" --warningyesno "The restore did not complete successfully. Keep any reported recovery snapshot and restore report.\n\nView redacted technical details?"; then
       show_output "Restore details" "$run_output"
     fi
   fi
+}
+
+restore_plan_summary() {
+  local details=$1 plugin_remove plugin_install plugin_restore plugin_settings css_restore css_remove artwork_restore artwork_remove lines
+  plugin_remove=$(printf '%s\n' "$details" | grep -Ec '^Plugin action: remove \|' || true)
+  plugin_install=$(printf '%s\n' "$details" | grep -Ec '^Plugin action: create \|' || true)
+  plugin_restore=$(printf '%s\n' "$details" | grep -Ec '^Plugin action: replace \|' || true)
+  plugin_settings=$(printf '%s\n' "$details" | sed -n 's/^File action: \(create\|replace\) | decky | decky\/\(settings\|data\)\/\([^/]*\)\/.*$/\2/p' | sort -u | sed '/^$/d' | wc -l)
+  css_restore=$(printf '%s\n' "$details" | sed -n 's/^File action: \(create\|replace\) | css-loader | css-loader\/themes\/\([^/]*\)\/.*$/\2/p' | sort -u | sed '/^$/d' | wc -l)
+  css_remove=$(printf '%s\n' "$details" | sed -n 's/^File action: remove | css-loader | css-loader\/themes\/\([^/]*\)\/.*$/\1/p' | sort -u | sed '/^$/d' | wc -l)
+  artwork_restore=$(printf '%s\n' "$details" | grep -Ec '^File action: \(create\|replace\) | steam | steam/artwork/' || true)
+  artwork_remove=$(printf '%s\n' "$details" | grep -Ec '^File action: remove | steam | steam/artwork/' || true)
+  lines=()
+  (( plugin_install > 0 )) && lines+=("• Install $plugin_install plugins")
+  (( plugin_restore > 0 )) && lines+=("• Restore $plugin_restore plugins")
+  (( plugin_remove > 0 )) && lines+=("• Remove $plugin_remove plugins added after this backup")
+  (( plugin_settings > 0 )) && lines+=("• Restore $plugin_settings plugin settings")
+  (( css_restore > 0 )) && lines+=("• Restore $css_restore CSS Loader themes and settings")
+  (( css_remove > 0 )) && lines+=("• Remove $css_remove CSS Loader themes added later")
+  (( artwork_restore > 0 )) && lines+=("• Restore $artwork_restore Steam artwork items")
+  (( artwork_remove > 0 )) && lines+=("• Remove $artwork_remove artwork items added later")
+  if (( ${#lines[@]} == 0 )); then
+    printf 'This Steam Deck already matches this backup.\n\nNo restore transaction is needed.'
+    return
+  fi
+  printf 'Deck Snapshot will return your supported customization to this backup.\n\nChanges:\n%s\n\nA safety backup will be created first.' "$(printf '%s\n' "${lines[@]}")"
 }
 
 settings_dialog() {
@@ -1082,8 +1130,25 @@ settings_tools_menu() {
 }
 
 main() {
-  local choice summary
+  local choice summary pending
   local -a actions
+  if ! pending=$("$CLI" restore pending 2>&1); then
+    "$KDIALOG" --title "Restore needs attention" --msgbox "Deck Snapshot restored the backup, but part of your setup did not load as expected.\n\nOpen Technical details from Settings & tools before starting another restore."
+    return
+  else
+    case "$pending" in
+      *restart_required*)
+        choice=$("$KDIALOG" --title "Restart required" --menu "Your customization has been restored, but your Steam Deck still needs to restart to finish applying it." restart "Restart now" close "Close") || return
+        if [[ "$choice" == restart ]]; then
+          "$CLI" restore reboot >/dev/null 2>&1 || true
+        fi
+        return
+        ;;
+      *complete*)
+        "$KDIALOG" --title "Restore complete" --msgbox "Your saved customization has been restored and verified."
+        ;;
+    esac
+  fi
   startup_update_check
   while true; do
     summary=$(dashboard_summary)

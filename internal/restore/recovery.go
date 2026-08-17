@@ -30,7 +30,7 @@ func createRecovery(ctx context.Context, plan Plan, directory string, now time.T
 	result := discovery.Result{Manifest: value}
 	for _, action := range plan.Actions {
 		switch action.Operation {
-		case "replace":
+		case "replace", "remove":
 			if err := ValidateTarget(action.TargetRoot, action.TargetPath); err != nil {
 				return snapshot.Created{}, err
 			}
@@ -99,7 +99,7 @@ func createRecovery(ctx context.Context, plan Plan, directory string, now time.T
 			result.Manifest.Exclusions = append(result.Manifest.Exclusions, manifest.Exclusion{LogicalPath: "recovery/plugins/" + action.Directory, Component: "recovery/plugins", Reason: "plugin_absent_before_restore"})
 			continue
 		}
-		if action.Operation != "replace" {
+		if action.Operation != "replace" && action.Operation != "remove" {
 			continue
 		}
 		var fingerprint string
@@ -172,7 +172,7 @@ func validateStagedRecovery(plan Plan, expected, actual manifest.Manifest, stage
 	}
 	expectedStaged := make(map[string]manifest.File)
 	for _, action := range plan.Actions {
-		if action.Operation != "replace" {
+		if action.Operation != "replace" && action.Operation != "remove" {
 			continue
 		}
 		entry, declared := manifestFiles[action.LogicalPath]
@@ -189,7 +189,7 @@ func validateStagedRecovery(plan Plan, expected, actual manifest.Manifest, stage
 		expectedStaged[deckyLoaderRecoveryLogicalPath] = entry
 	}
 	for _, action := range plan.PluginActions {
-		if action.Operation != "replace" || action.Method != pluginMethodDeckyAPI {
+		if (action.Operation != "replace" && action.Operation != "remove") || action.Method != pluginMethodDeckyAPI {
 			continue
 		}
 		prefix := "recovery/plugins/" + action.Directory + "/"

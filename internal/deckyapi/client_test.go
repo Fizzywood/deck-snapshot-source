@@ -20,10 +20,18 @@ import (
 const testToken = "01234567-89ab-cdef-0123-456789abcdef"
 
 type receivedCall struct {
-	Type  int               `json:"type"`
-	ID    int               `json:"id"`
-	Route string            `json:"route"`
-	Args  []json.RawMessage `json:"args"`
+	Type    int               `json:"type"`
+	ID      int               `json:"id"`
+	Route   string            `json:"route"`
+	Args    []json.RawMessage `json:"args"`
+	RawArgs json.RawMessage   `json:"-"`
+}
+
+type receivedCallWire struct {
+	Type  int             `json:"type"`
+	ID    int             `json:"id"`
+	Route string          `json:"route"`
+	Args  json.RawMessage `json:"args"`
 }
 
 func TestProbeValidatesVersionWithoutOpeningWebsocket(t *testing.T) {
@@ -80,7 +88,7 @@ func TestProbeRejectsUnsupportedVersionBeforeNetwork(t *testing.T) {
 func TestInstallUsesExactPromptAndCompletionProtocol(t *testing.T) {
 	t.Parallel()
 	archive, checksum := writeArchive(t)
-	serverErrors := make(chan error, 1)
+	serverErrors := make(chan error, 2)
 	server := newProtocolServer(t, func(ctx context.Context, connection *websocket.Conn) error {
 		first, err := readCall(ctx, connection)
 		if err != nil {
@@ -187,6 +195,142 @@ func TestUninstallUsesBoundedRoute(t *testing.T) {
 	}
 }
 
+func TestInventoryUsesOnlyFixedRoute(t *testing.T) {
+	t.Parallel()
+	serverErrors := make(chan error, 1)
+	server := newProtocolServer(t, func(ctx context.Context, connection *websocket.Conn) error {
+		call, err := readCall(ctx, connection)
+		if err != nil {
+			return err
+		}
+		if call.Type != 0 || call.ID != 1 || call.Route != "loader/get_plugins" || string(call.RawArgs) != "[]" || len(call.Args) != 0 {
+			return &protocolTestError{"unexpected inventory request"}
+		}
+		return wsjson.Write(ctx, connection, inboundMessage{Type: 1, ID: 1, Result: json.RawMessage(`[{"name":"CSS Loader","version":"1.0","disabled":true}]`)})
+	}, serverErrors)
+	t.Cleanup(server.Close)
+	client, err := newTestClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plugins, err := client.Inventory(context.Background())
+	if err != nil || len(plugins) != 1 || plugins[0].Name != "CSS Loader" || !plugins[0].Disabled {
+		t.Fatalf("Inventory() = %#v, %v", plugins, err)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInventoryFailsClosedOnDeckyErrorReply(t *testing.T) {
+	t.Parallel()
+	serverErrors := make(chan error, 1)
+	server := newProtocolServer(t, func(ctx context.Context, connection *websocket.Conn) error {
+		call, err := readCall(ctx, connection)
+		if err != nil {
+			return err
+		}
+		if call.Route != "loader/get_plugins" || string(call.RawArgs) != "[]" {
+			return &protocolTestError{"unexpected inventory error-request"}
+		}
+		return wsjson.Write(ctx, connection, inboundMessage{Type: -1, ID: 1, Error: json.RawMessage(`{"name":"TypeError","message":"argument expansion failed"}`)})
+	}, serverErrors)
+	t.Cleanup(server.Close)
+	client, err := newTestClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Inventory(context.Background()); err == nil || !strings.Contains(err.Error(), "TypeError: argument expansion failed") {
+		t.Fatalf("Inventory() error = %v", err)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDisabledPluginNamesAreStrictAndCanonical(t *testing.T) {
+	t.Parallel()
+	values, err := normalizePluginNames([]string{"CSS Loader", "Alarm Me"})
+	if err != nil || !samePluginNames(values, []string{"Alarm Me", "CSS Loader"}) {
+		t.Fatalf("normalizePluginNames() = %#v, %v", values, err)
+	}
+	if _, err := normalizePluginNames([]string{"CSS Loader", "CSS Loader"}); err == nil {
+		t.Fatal("duplicate disabled plugin state was accepted")
+	}
+	if _, err := normalizePluginNames([]string{" CSS Loader"}); err == nil {
+		t.Fatal("unsafe disabled plugin state was accepted")
+	}
+}
+
+func TestRestartUsesBoundedRouteAndObservesReplacement(t *testing.T) {
+	t.Parallel()
+	deckyHome := writeDeckyVersion(t, SupportedVersion)
+	var restarting atomic.Bool
+	var offlineProbes atomic.Int32
+	serverErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/auth/token":
+			if restarting.Load() && offlineProbes.Add(1) == 1 {
+				http.Error(response, "restarting", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = response.Write([]byte(testToken))
+		case "/ws":
+			if request.URL.Query().Get("auth") != testToken {
+				http.Error(response, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			connection, err := websocket.Accept(response, request, nil)
+			if err != nil {
+				serverErrors <- err
+				return
+			}
+			defer connection.CloseNow()
+			call, err := readCall(request.Context(), connection)
+			if err != nil {
+				serverErrors <- err
+				return
+			}
+			switch call.Route {
+			case "updater/do_restart":
+				if call.Type != 0 || call.ID != 1 || string(call.RawArgs) != "[]" || len(call.Args) != 0 {
+					serverErrors <- &protocolTestError{"unexpected restart request"}
+					return
+				}
+				restarting.Store(true)
+				serverErrors <- wsjson.Write(request.Context(), connection, inboundMessage{Type: 1, ID: 1, Result: json.RawMessage("null")})
+			case "utilities/restart_webhelper":
+				if call.Type != 0 || call.ID != 1 || string(call.RawArgs) != "[]" || len(call.Args) != 0 {
+					serverErrors <- &protocolTestError{"unexpected Steam reload request"}
+					return
+				}
+				serverErrors <- wsjson.Write(request.Context(), connection, inboundMessage{Type: 1, ID: 1, Result: json.RawMessage("null")})
+			default:
+				serverErrors <- &protocolTestError{"unexpected runtime request"}
+			}
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client, err := newTestClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Restart(context.Background(), deckyHome); err != nil {
+		t.Fatalf("Restart() error = %v", err)
+	}
+	if offlineProbes.Load() < 2 {
+		t.Fatalf("restart did not observe an unavailable then live replacement: %d probes", offlineProbes.Load())
+	}
+	for range 2 {
+		if err := <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func newProtocolServer(t *testing.T, serve func(context.Context, *websocket.Conn) error, errorsChannel chan<- error) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -212,9 +356,45 @@ func newProtocolServer(t *testing.T, serve func(context.Context, *websocket.Conn
 }
 
 func readCall(ctx context.Context, connection *websocket.Conn) (receivedCall, error) {
-	var call receivedCall
-	err := wsjson.Read(ctx, connection, &call)
-	return call, err
+	var wire receivedCallWire
+	if err := wsjson.Read(ctx, connection, &wire); err != nil {
+		return receivedCall{}, err
+	}
+	if string(wire.Args) == "null" || len(wire.Args) == 0 {
+		return receivedCall{}, &protocolTestError{"call arguments were not an array"}
+	}
+	var arguments []json.RawMessage
+	if err := json.Unmarshal(wire.Args, &arguments); err != nil {
+		return receivedCall{}, err
+	}
+	return receivedCall{Type: wire.Type, ID: wire.ID, Route: wire.Route, Args: arguments, RawArgs: wire.Args}, nil
+}
+
+func TestNilCallArgumentsSerializeAsEmptyArray(t *testing.T) {
+	t.Parallel()
+	encoded, err := json.Marshal(outboundCall{Type: 0, ID: 1, Route: "loader/get_plugins", Args: normalizeCallArguments(nil)})
+	if err != nil || !strings.Contains(string(encoded), `"args":[]`) || strings.Contains(string(encoded), `"args":null`) {
+		t.Fatalf("encoded nil-argument call = %s, error=%v", encoded, err)
+	}
+}
+
+func TestParameterizedCallArgumentsRemainUnchanged(t *testing.T) {
+	t.Parallel()
+	arguments := []any{"disabled_plugins", []string{"CSS Loader"}}
+	encoded, err := json.Marshal(outboundCall{Type: 0, ID: 1, Route: "utilities/settings/set", Args: normalizeCallArguments(arguments)})
+	if err != nil || !strings.Contains(string(encoded), `"args":["disabled_plugins",["CSS Loader"]]`) {
+		t.Fatalf("encoded parameterized call = %s, error=%v", encoded, err)
+	}
+}
+
+func TestDeckyErrorDetailsAreBoundedAndFailClosed(t *testing.T) {
+	t.Parallel()
+	if detail := boundedDeckyError(json.RawMessage(`{"name":"TypeError","message":"argument expansion failed"}`)); detail != "TypeError: argument expansion failed" {
+		t.Fatalf("boundedDeckyError() = %q", detail)
+	}
+	if detail := boundedDeckyError(json.RawMessage(`{"name":"TypeError","message":"token=must-not-appear"}`)); detail != "" {
+		t.Fatalf("sensitive Decky error detail was accepted: %q", detail)
+	}
 }
 
 func rawArguments(values ...any) []json.RawMessage {

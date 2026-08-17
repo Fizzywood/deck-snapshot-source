@@ -159,6 +159,87 @@ func buildPluginActions(ctx context.Context, paths platform.Paths, snapshotID st
 		}
 		actions = append(actions, action)
 	}
+	// Only positively identified, real plugin directories are candidates for
+	// convergence removal. Unknown files and stale settings/data roots are not
+	// considered here and are deliberately left alone.
+	snapshotDirectories := make(map[string]struct{}, len(resolutions))
+	for _, resolution := range resolutions {
+		snapshotDirectories[resolution.SnapshotDirectory] = struct{}{}
+	}
+	pluginRoot := filepath.Join(paths.Decky, "plugins")
+	rootInfo, rootErr := os.Lstat(pluginRoot)
+	if errors.Is(rootErr, os.ErrNotExist) {
+		sort.Slice(actions, func(i, j int) bool { return actions[i].Directory < actions[j].Directory })
+		return actions, nil
+	}
+	if rootErr != nil || !rootInfo.IsDir() || isLinkOrReparsePoint(rootInfo) {
+		return nil, errors.New("Decky plugin root is not a real directory")
+	}
+	entries, readErr := os.ReadDir(pluginRoot)
+	if readErr != nil {
+		return nil, fmt.Errorf("read Decky plugin root: %w", readErr)
+	}
+	// Decky's uninstall route accepts the display name, not a filesystem path.
+	// Count only fully parseable identities first so an action is never emitted
+	// when two live directories could resolve to the same uninstall target.
+	nameCounts := make(map[string]int)
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		metadata, err := pluginstore.InspectPackageMetadata(filepath.Join(pluginRoot, entry.Name()))
+		if err == nil && metadata.Name != "" && metadata.Author != "" && metadata.Version != "" {
+			nameCounts[metadata.Name]++
+		}
+	}
+	for _, entry := range entries {
+		if _, present := snapshotDirectories[entry.Name()]; present {
+			continue
+		}
+		directory := entry.Name()
+		action := PluginAction{Directory: directory, TargetRoot: pluginRoot, TargetPath: filepath.Join(pluginRoot, directory), PreserveRoot: filepath.Join(paths.State, "preserved"), PreservePath: filepath.Join(paths.State, "preserved", snapshotID, directory)}
+		if err := manifest.ValidateLogicalPath("plugin/"+directory, resourceLimits.MaxPathLength); err != nil || strings.ContainsAny(directory, `/\`) || !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			action.Operation = "blocked"
+			action.Reason = "An extra plugin is not a safely identified real plugin directory."
+			actions = append(actions, action)
+			continue
+		}
+		fingerprint, files, bytes, err := fingerprintDeckyManagedPluginTree(action.TargetPath, resourceLimits)
+		if err != nil {
+			action.Operation = "blocked"
+			action.Reason = "The extra plugin could not be safely fingerprinted."
+			actions = append(actions, action)
+			continue
+		}
+		metadata, err := pluginstore.InspectPackageMetadata(action.TargetPath)
+		if err != nil || metadata.Name == "" || metadata.Author == "" || metadata.Version == "" {
+			action.Operation = "blocked"
+			action.Reason = "The extra plugin identity could not be verified."
+			actions = append(actions, action)
+			continue
+		}
+		if nameCounts[metadata.Name] != 1 {
+			action.Operation = "blocked"
+			action.Reason = "The extra plugin display name is ambiguous, so Decky Loader removal is unsafe."
+			actions = append(actions, action)
+			continue
+		}
+		if err := probeDecky(); err != nil {
+			action.Operation = "blocked"
+			action.Reason = "The extra plugin cannot be removed through the supported Decky Loader boundary."
+			actions = append(actions, action)
+			continue
+		}
+		action.Method = pluginMethodDeckyAPI
+		action.Operation = "remove"
+		action.ExistingFingerprint = fingerprint
+		action.ExistingFiles = files
+		action.ExistingBytes = bytes
+		action.ExistingName = metadata.Name
+		action.ExistingAuthor = metadata.Author
+		action.ExistingVersion = metadata.Version
+		actions = append(actions, action)
+	}
 	sort.Slice(actions, func(i, j int) bool { return actions[i].Directory < actions[j].Directory })
 	return actions, nil
 }

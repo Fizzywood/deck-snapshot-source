@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Fizzywood/deck-snapshot/internal/deckyapi"
 	"github.com/Fizzywood/deck-snapshot/internal/discovery"
 	"github.com/Fizzywood/deck-snapshot/internal/limits"
 	"github.com/Fizzywood/deck-snapshot/internal/manifest"
@@ -256,7 +257,7 @@ func TestBuildPlanRejectsSymlinkedStateRoot(t *testing.T) {
 	}
 }
 
-func TestRunRestoresFixtureAndIsIdempotent(t *testing.T) {
+func TestRunRestoresFixtureAndBlocksSecondRunUntilPostBoot(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("crash-safe transactional restore requires Linux rename exchange")
 	}
@@ -273,7 +274,7 @@ func TestRunRestoresFixtureAndIsIdempotent(t *testing.T) {
 	resolver := staticResolver{url: server.URL + "/fixture.zip", hash: hex.EncodeToString(hash[:])}
 	plan := buildTestPlan(t, target, created.Path, resolver, time.Date(2026, 8, 14, 15, 0, 0, 0, time.UTC))
 	report, err := Run(context.Background(), testRunOptions(target, plan, server.Client()))
-	if err != nil || report.Status != "succeeded" || report.RecoverySnapshotPath == "" || report.ReportPath == "" {
+	if err != nil || report.Status != "awaiting_post_boot_verification" || report.RecoverySnapshotPath == "" || report.ReportPath == "" {
 		t.Fatalf("Run() report=%#v error=%v", report, err)
 	}
 	if _, err := snapshot.Validate(report.RecoverySnapshotPath, limits.Default()); err != nil {
@@ -298,18 +299,41 @@ func TestRunRestoresFixtureAndIsIdempotent(t *testing.T) {
 		t.Fatalf("restored payload inventory differs\nwant: %v\n got: %v", payloadInventory(source.Manifest.Files), payloadInventory(rediscovered.Manifest.Files))
 	}
 
+	createTargetState(t, target, source, "css-loader/themes/", "changed after pending restore")
 	secondPlan := buildTestPlan(t, target, created.Path, resolver, time.Date(2026, 8, 14, 15, 1, 0, 0, time.UTC))
-	for _, action := range secondPlan.Actions {
-		if action.Operation != "unchanged" {
-			t.Fatalf("second file restore is not idempotent: %#v", action)
-		}
+	if !secondPlan.HasMutations() {
+		t.Fatal("second plan should contain a mutation after the live state changed")
 	}
-	if len(secondPlan.PluginActions) != 1 || secondPlan.PluginActions[0].Operation != "unchanged" {
-		t.Fatalf("second plugin restore is not idempotent: %#v", secondPlan.PluginActions)
+	if _, err := Run(context.Background(), testRunOptions(target, secondPlan, server.Client())); err == nil {
+		t.Fatal("second mutating Run() accepted a restore before the pending post-boot verification completed")
 	}
-	secondReport, err := Run(context.Background(), testRunOptions(target, secondPlan, server.Client()))
-	if err != nil || secondReport.Status != "succeeded" {
-		t.Fatalf("second Run() report=%#v error=%v", secondReport, err)
+}
+
+func TestRunPreservesAwaitingRebootMarkerWhenRebootRequestFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("crash-safe transactional restore requires Linux rename exchange")
+	}
+	archive := fixturePluginZIP(t)
+	hash := sha256.Sum256(archive)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/zip")
+		response.Write(archive)
+	}))
+	defer server.Close()
+	created, source := fixtureSnapshot(t)
+	target := targetPaths(t)
+	createTargetState(t, target, source, "decky/settings/", "outdated settings")
+	resolver := staticResolver{url: server.URL + "/fixture.zip", hash: hex.EncodeToString(hash[:])}
+	plan := buildTestPlan(t, target, created.Path, resolver, time.Date(2026, 8, 14, 15, 0, 0, 0, time.UTC))
+	options := testRunOptions(target, plan, server.Client())
+	options.Rebooter = failingRequestRebooter{}
+	report, err := Run(context.Background(), options)
+	if err == nil || report.Status != "reboot_required" {
+		t.Fatalf("Run() report=%#v error=%v", report, err)
+	}
+	marker, exists, markerErr := loadIncompleteTransaction(target.Home, target.State)
+	if markerErr != nil || !exists || marker.Phase != "awaiting_reboot" {
+		t.Fatalf("pending reboot marker = %#v, exists=%v, error=%v", marker, exists, markerErr)
 	}
 }
 
@@ -365,6 +389,90 @@ func TestRunRollsBackFilesAndPluginsAfterInjectedFailure(t *testing.T) {
 	}
 	if _, err := snapshot.Validate(report.RecoverySnapshotPath, limits.Default()); err != nil {
 		t.Fatalf("recovery snapshot was not retained: %v", err)
+	}
+}
+
+func TestRunRestoresOriginalDeckyStateBeforeReportingRollback(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("crash-safe transactional restore requires Linux rename exchange")
+	}
+	archive := fixturePluginZIP(t)
+	hash := sha256.Sum256(archive)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) { response.Write(archive) }))
+	defer server.Close()
+	created, _ := fixtureSnapshot(t)
+	target := targetPaths(t)
+	plan := buildTestPlan(t, target, created.Path, staticResolver{url: server.URL, hash: hex.EncodeToString(hash[:])}, time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC))
+	coordinator := &cleanupObservingRuntimeCoordinator{}
+	options := testRunOptions(target, plan, server.Client())
+	options.RuntimeCoordinator = coordinator
+	options.BeforeAction = func(Action) error { return errors.New("injected failure after Decky quiescence") }
+	report, err := Run(context.Background(), options)
+	if err == nil || report.Status != "rolled_back" {
+		t.Fatalf("Run() report=%#v error=%v", report, err)
+	}
+	if coordinator.restoreCalls != 1 {
+		t.Fatalf("original Decky state was restored %d times, want 1", coordinator.restoreCalls)
+	}
+	if _, pending, markerErr := loadIncompleteTransaction(target.Home, target.State); markerErr != nil || pending {
+		t.Fatalf("marker after proven cleanup: pending=%v error=%v", pending, markerErr)
+	}
+}
+
+func TestRunRecoversOriginalDeckyStateAfterQuiescenceFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("crash-safe transactional restore requires Linux rename exchange")
+	}
+	archive := fixturePluginZIP(t)
+	hash := sha256.Sum256(archive)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) { response.Write(archive) }))
+	defer server.Close()
+	created, _ := fixtureSnapshot(t)
+	target := targetPaths(t)
+	plan := buildTestPlan(t, target, created.Path, staticResolver{url: server.URL, hash: hex.EncodeToString(hash[:])}, time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC))
+	coordinator := &cleanupObservingRuntimeCoordinator{quiesceErr: errors.New("Decky restart failed during quiescence")}
+	options := testRunOptions(target, plan, server.Client())
+	options.RuntimeCoordinator = coordinator
+	report, err := Run(context.Background(), options)
+	if err == nil || report.Status != "rolled_back" {
+		t.Fatalf("Run() report=%#v error=%v", report, err)
+	}
+	if coordinator.restoreCalls != 1 {
+		t.Fatalf("original Decky state was restored %d times, want 1", coordinator.restoreCalls)
+	}
+	if _, pending, markerErr := loadIncompleteTransaction(target.Home, target.State); markerErr != nil || pending {
+		t.Fatalf("marker after proven cleanup: pending=%v error=%v", pending, markerErr)
+	}
+}
+
+func TestRunRetainsRecoveryMarkerWhenDeckyCleanupCannotBeProven(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("crash-safe transactional restore requires Linux rename exchange")
+	}
+	archive := fixturePluginZIP(t)
+	hash := sha256.Sum256(archive)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) { response.Write(archive) }))
+	defer server.Close()
+	created, _ := fixtureSnapshot(t)
+	target := targetPaths(t)
+	plan := buildTestPlan(t, target, created.Path, staticResolver{url: server.URL, hash: hex.EncodeToString(hash[:])}, time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC))
+	coordinator := &cleanupObservingRuntimeCoordinator{restoreErr: errors.New("Decky restart failed")}
+	options := testRunOptions(target, plan, server.Client())
+	options.RuntimeCoordinator = coordinator
+	options.BeforeAction = func(Action) error { return errors.New("injected failure after Decky quiescence") }
+	report, err := Run(context.Background(), options)
+	if err == nil || report.Status != "rollback_failed" || report.RollbackError == "" {
+		t.Fatalf("Run() report=%#v error=%v", report, err)
+	}
+	marker, pending, markerErr := loadIncompleteTransaction(target.Home, target.State)
+	if markerErr != nil || !pending || marker.Phase != "recovery_required" {
+		t.Fatalf("recovery marker = %#v pending=%v error=%v", marker, pending, markerErr)
+	}
+	if !equalPluginNames(marker.OriginalPluginInventory, []string{"CSS Loader"}) || !equalPluginNames(marker.OriginalDisabledPlugins, []string{}) || !equalPluginNames(marker.TemporaryDisabledPlugins, []string{"CSS Loader"}) {
+		t.Fatalf("recovery marker did not retain original and temporary Decky state: %#v", marker)
+	}
+	if _, secondErr := Run(context.Background(), testRunOptions(target, plan, server.Client())); secondErr == nil {
+		t.Fatal("later transaction was accepted despite recovery-required marker")
 	}
 }
 
@@ -565,8 +673,109 @@ func testRunOptions(target platform.Paths, plan Plan, client *http.Client) RunOp
 	return RunOptions{
 		Plan: plan, ApprovedPlanID: plan.PlanID, ApprovedHash: plan.ApprovalHash, Limits: limits.Default(),
 		WorkDirectory: filepath.Join(target.State, "work"), RecoveryDirectory: filepath.Join(target.State, "recovery"), ReportDirectory: filepath.Join(target.State, "reports"),
-		Now: func() time.Time { return time.Date(2026, 8, 14, 17, 0, 0, 0, time.UTC) }, AvailableBytes: func(string) (uint64, error) { return math.MaxUint64, nil }, HTTPClient: client,
+		Now: func() time.Time { return time.Date(2026, 8, 14, 17, 0, 0, 0, time.UTC) }, AvailableBytes: func(string) (uint64, error) { return math.MaxUint64, nil }, HTTPClient: client, RuntimeCoordinator: testRuntimeCoordinator{}, Rebooter: testRebooter{},
 	}
+}
+
+type testRuntimeCoordinator struct{}
+
+type testRebooter struct{}
+
+func (testRebooter) Preflight(context.Context) error { return nil }
+func (testRebooter) Request(context.Context) error   { return nil }
+func (testRebooter) BootID(context.Context) (string, error) {
+	return "00000000-0000-0000-0000-000000000000", nil
+}
+
+type failingRequestRebooter struct{ testRebooter }
+
+func (failingRequestRebooter) Request(context.Context) error {
+	return errors.New("reboot authorization failed")
+}
+
+func (testRuntimeCoordinator) Refresh(context.Context, TargetReference) error { return nil }
+func (testRuntimeCoordinator) PlanQuiescence(context.Context, TargetReference) (Quiescence, error) {
+	return Quiescence{}, nil
+}
+func (testRuntimeCoordinator) Quiesce(context.Context, TargetReference, Quiescence) error { return nil }
+func (testRuntimeCoordinator) KeepDisabled(context.Context, *Quiescence, string) error    { return nil }
+func (testRuntimeCoordinator) VerifyQuiescent(context.Context, Quiescence, []string) error {
+	return nil
+}
+func (testRuntimeCoordinator) SynchronizeQuiescence(context.Context, *Quiescence, []string) error {
+	return nil
+}
+func (testRuntimeCoordinator) RestoreOriginal(context.Context, TargetReference, Quiescence) error {
+	return nil
+}
+func (testRuntimeCoordinator) QuiesceSteam(context.Context) error { return nil }
+
+type observingFailingRuntimeCoordinator struct{ observe func() }
+
+type cleanupObservingRuntimeCoordinator struct {
+	restoreCalls int
+	restoreErr   error
+	quiesceErr   error
+}
+
+func (*cleanupObservingRuntimeCoordinator) Refresh(context.Context, TargetReference) error {
+	return nil
+}
+func (*cleanupObservingRuntimeCoordinator) PlanQuiescence(context.Context, TargetReference) (Quiescence, error) {
+	inventory := []deckyapi.PluginStatus{{Name: "CSS Loader", Version: "1"}}
+	return Quiescence{OriginalDisabled: []string{}, TemporaryDisabled: []string{"CSS Loader"}, OriginalInventory: append([]deckyapi.PluginStatus(nil), inventory...), Inventory: inventory}, nil
+}
+func (coordinator *cleanupObservingRuntimeCoordinator) Quiesce(context.Context, TargetReference, Quiescence) error {
+	return coordinator.quiesceErr
+}
+func (*cleanupObservingRuntimeCoordinator) KeepDisabled(context.Context, *Quiescence, string) error {
+	return nil
+}
+func (*cleanupObservingRuntimeCoordinator) VerifyQuiescent(context.Context, Quiescence, []string) error {
+	return nil
+}
+func (*cleanupObservingRuntimeCoordinator) SynchronizeQuiescence(context.Context, *Quiescence, []string) error {
+	return nil
+}
+func (coordinator *cleanupObservingRuntimeCoordinator) RestoreOriginal(context.Context, TargetReference, Quiescence) error {
+	coordinator.restoreCalls++
+	return coordinator.restoreErr
+}
+func (*cleanupObservingRuntimeCoordinator) QuiesceSteam(context.Context) error { return nil }
+
+func (coordinator observingFailingRuntimeCoordinator) Refresh(context.Context, TargetReference) error {
+	if coordinator.observe != nil {
+		coordinator.observe()
+	}
+	return errors.New("runtime refresh failed")
+}
+func (observingFailingRuntimeCoordinator) PlanQuiescence(context.Context, TargetReference) (Quiescence, error) {
+	return Quiescence{}, nil
+}
+func (observingFailingRuntimeCoordinator) Quiesce(context.Context, TargetReference, Quiescence) error {
+	return nil
+}
+func (observingFailingRuntimeCoordinator) KeepDisabled(context.Context, *Quiescence, string) error {
+	return nil
+}
+func (observingFailingRuntimeCoordinator) VerifyQuiescent(context.Context, Quiescence, []string) error {
+	return nil
+}
+func (observingFailingRuntimeCoordinator) SynchronizeQuiescence(context.Context, *Quiescence, []string) error {
+	return nil
+}
+func (observingFailingRuntimeCoordinator) RestoreOriginal(context.Context, TargetReference, Quiescence) error {
+	return nil
+}
+func (observingFailingRuntimeCoordinator) QuiesceSteam(context.Context) error { return nil }
+
+func containsPluginOperation(actions []PluginAction, directory, operation string) bool {
+	for _, action := range actions {
+		if action.Directory == directory && action.Operation == operation {
+			return true
+		}
+	}
+	return false
 }
 
 func createTargetState(t *testing.T, target platform.Paths, source discovery.Result, prefix, replacement string) {
