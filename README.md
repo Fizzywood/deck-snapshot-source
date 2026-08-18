@@ -1,6 +1,6 @@
-# Deck Snapshot Source — v0.1.7
+# Deck Snapshot Source — v0.1.8
 
-This public repository contains clean source snapshots corresponding to published Deck Snapshot releases. The `v0.1.7` tag matches the same version in the [official download repository](https://github.com/Fizzywood/deck-snapshot-releases/releases/tag/v0.1.7).
+This public repository contains clean source snapshots corresponding to published Deck Snapshot releases. The `v0.1.8` tag matches the same version in the [official download repository](https://github.com/Fizzywood/deck-snapshot-releases/releases/tag/v0.1.8).
 
 **[Download Deck Snapshot](https://github.com/Fizzywood/deck-snapshot-releases/releases/latest)**
 

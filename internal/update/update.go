@@ -24,10 +24,13 @@ import (
 )
 
 const (
-	stableManifestURL = "https://github.com/Fizzywood/deck-snapshot-releases/releases/latest/download/stable.json"
-	installerName     = "deck_snapshot_installer.desktop"
-	maxManifestBytes  = 64 * 1024
-	maxInstallerBytes = 4 * 1024 * 1024
+	legacyReleaseOwner    = "Fizzywood"
+	migrationReleaseOwner = "TAndrson"
+	releaseRepository     = "deck-snapshot-releases"
+	stableManifestURL     = "https://github.com/Fizzywood/deck-snapshot-releases/releases/latest/download/stable.json"
+	installerName         = "deck_snapshot_installer.desktop"
+	maxManifestBytes      = 64 * 1024
+	maxInstallerBytes     = 4 * 1024 * 1024
 )
 
 var stableVersion = regexp.MustCompile(`^v([0-9]+)\.([0-9]+)\.([0-9]+)$`)
@@ -258,28 +261,40 @@ func (manifest Manifest) installer() (Asset, error) {
 	return Asset{}, errors.New("stable release metadata is missing the installer")
 }
 
+func allowedReleaseOwner(owner string) bool {
+	return owner == legacyReleaseOwner || owner == migrationReleaseOwner
+}
+
+func allowedReleaseAssetName(name string) bool {
+	return name == installerName || name == "deck-snapshot-linux-amd64.tar.gz" || name == "deck-snapshot-linux-amd64.sha256"
+}
+
 func validAssetURL(rawURL, version string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.User != nil || parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
 	parts := strings.Split(strings.TrimPrefix(path.Clean(parsed.Path), "/"), "/")
-	if len(parts) != 6 || parts[0] != "Fizzywood" || parts[1] != "deck-snapshot-releases" || parts[2] != "releases" || parts[3] != "download" || parts[4] == "" || parts[5] == "" {
+	if len(parts) != 6 || !allowedReleaseOwner(parts[0]) || parts[1] != releaseRepository || parts[2] != "releases" || parts[3] != "download" || parts[4] == "" || !allowedReleaseAssetName(parts[5]) {
 		return false
 	}
-	if version != "" && parts[4] != version {
-		return false
-	}
-	return parts[5] == installerName || parts[5] == "deck-snapshot-linux-amd64.tar.gz" || parts[5] == "deck-snapshot-linux-amd64.sha256"
+	return version == "" || parts[4] == version
 }
 
 func allowedRedirectURL(value *url.URL) bool {
-	if value == nil || value.Scheme != "https" || value.User != nil || value.Port() != "" {
+	if value == nil || value.Scheme != "https" || value.User != nil || value.Port() != "" || value.RawQuery != "" || value.Fragment != "" {
 		return false
 	}
 	host := strings.ToLower(value.Hostname())
 	if host == "github.com" {
-		return value.Path == "/Fizzywood/deck-snapshot-releases/releases/latest/download/stable.json" || strings.HasPrefix(value.Path, "/Fizzywood/deck-snapshot-releases/releases/download/")
+		parts := strings.Split(strings.TrimPrefix(path.Clean(value.Path), "/"), "/")
+		if len(parts) != 6 || !allowedReleaseOwner(parts[0]) || parts[1] != releaseRepository || parts[2] != "releases" {
+			return false
+		}
+		if parts[3] == "latest" {
+			return parts[4] == "download" && parts[5] == "stable.json"
+		}
+		return parts[3] == "download" && parts[4] != "" && allowedReleaseAssetName(parts[5])
 	}
 	return host == "release-assets.githubusercontent.com" || host == "objects.githubusercontent.com" || host == "github-releases.githubusercontent.com"
 }
@@ -301,6 +316,7 @@ func parseVersion(value string) (version, error) {
 	}
 	return version{values[0], values[1], values[2]}, nil
 }
+
 func compareVersions(left, right version) int {
 	for _, values := range [][2]int{{left.major, right.major}, {left.minor, right.minor}, {left.patch, right.patch}} {
 		if values[0] < values[1] {
@@ -312,6 +328,7 @@ func compareVersions(left, right version) int {
 	}
 	return 0
 }
+
 func runInstaller(ctx context.Context, installer string) error {
 	info, err := os.Lstat(installer)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > maxInstallerBytes {

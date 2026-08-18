@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -46,6 +47,60 @@ func TestCheckRejectsMalformedPrereleaseAndUnexpectedAssets(t *testing.T) {
 		if _, err := testClient(manifest, installer, nil).Check(context.Background(), "v0.1.5"); err == nil {
 			t.Fatalf("Check accepted invalid manifest %q", manifest)
 		}
+	}
+}
+
+func TestMigrationReleaseOwnersAreExplicitlyBounded(t *testing.T) {
+	for _, owner := range []string{legacyReleaseOwner, migrationReleaseOwner} {
+		asset := "https://github.com/" + owner + "/deck-snapshot-releases/releases/download/v0.1.8/deck_snapshot_installer.desktop"
+		if !validAssetURL(asset, "v0.1.8") {
+			t.Fatalf("migration owner %q was rejected", owner)
+		}
+		manifestRedirect, err := url.Parse("https://github.com/" + owner + "/deck-snapshot-releases/releases/latest/download/stable.json")
+		if err != nil || !allowedRedirectURL(manifestRedirect) {
+			t.Fatalf("manifest redirect for %q rejected: %v", owner, err)
+		}
+		releaseRedirect, err := url.Parse(asset)
+		if err != nil || !allowedRedirectURL(releaseRedirect) {
+			t.Fatalf("release redirect for %q rejected: %v", owner, err)
+		}
+	}
+	for _, owner := range []string{"tandrson", "OtherOwner", "Fizzywood-archive"} {
+		asset := "https://github.com/" + owner + "/deck-snapshot-releases/releases/download/v0.1.8/deck_snapshot_installer.desktop"
+		if validAssetURL(asset, "v0.1.8") {
+			t.Fatalf("unexpected owner %q accepted", owner)
+		}
+		redirect, err := url.Parse(asset)
+		if err == nil && allowedRedirectURL(redirect) {
+			t.Fatalf("unexpected redirect owner %q accepted", owner)
+		}
+	}
+}
+
+func TestMigrationRedirectRejectsUnexpectedAssetAndURLDecoration(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/TAndrson/deck-snapshot-releases/releases/download/v0.1.8/unexpected.bin",
+		"https://github.com/TAndrson/deck-snapshot-releases/releases/download/v0.1.8/deck_snapshot_installer.desktop?download=1",
+		"https://github.com/TAndrson/deck-snapshot-releases/releases/latest/download/stable.json#fragment",
+		"https://github.com/Fizzywood/deck-snapshot-releases/releases/download/v0.1.8/deck-snapshot-linux-amd64.tar.gz?x=1",
+	} {
+		value, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		if allowedRedirectURL(value) {
+			t.Fatalf("unsafe migration redirect accepted: %s", raw)
+		}
+	}
+}
+
+func TestCheckAcceptsPostRenameAssetURLs(t *testing.T) {
+	installer := validInstaller(t)
+	manifest := testManifestForOwner(migrationReleaseOwner, "v0.1.8", installer)
+	client := testClient(manifest, installer, nil)
+	status, err := client.Check(context.Background(), "v0.1.7")
+	if err != nil || status.Available != "v0.1.8" || status.UpToDate {
+		t.Fatalf("Check(post-rename) = %#v, %v", status, err)
 	}
 }
 
@@ -90,7 +145,8 @@ func testClient(manifest string, installer []byte, run func(context.Context, str
 		switch request.URL.String() {
 		case stableManifestURL:
 			return response(request, http.StatusOK, manifest), nil
-		case "https://github.com/Fizzywood/deck-snapshot-releases/releases/download/v0.1.6/deck_snapshot_installer.desktop":
+		case "https://github.com/Fizzywood/deck-snapshot-releases/releases/download/v0.1.6/deck_snapshot_installer.desktop",
+			"https://github.com/TAndrson/deck-snapshot-releases/releases/download/v0.1.8/deck_snapshot_installer.desktop":
 			return response(request, http.StatusOK, string(installer)), nil
 		default:
 			return response(request, http.StatusNotFound, ""), nil
@@ -99,9 +155,13 @@ func testClient(manifest string, installer []byte, run func(context.Context, str
 }
 
 func testManifest(version string, installer []byte) string {
+	return testManifestForOwner(legacyReleaseOwner, version, installer)
+}
+
+func testManifestForOwner(owner, version string, installer []byte) string {
 	sum := sha256.Sum256(installer)
 	asset := func(name string, size int, digest string) string {
-		return fmt.Sprintf(`{"name":%q,"url":%q,"size":%d,"sha256":%q}`, name, "https://github.com/Fizzywood/deck-snapshot-releases/releases/download/"+version+"/"+name, size, digest)
+		return fmt.Sprintf(`{"name":%q,"url":%q,"size":%d,"sha256":%q}`, name, "https://github.com/"+owner+"/deck-snapshot-releases/releases/download/"+version+"/"+name, size, digest)
 	}
 	return fmt.Sprintf(`{"schema_version":1,"version":%q,"published_at":"2026-08-16T00:00:00Z","assets":[%s,%s,%s]}`,
 		version,
