@@ -1,8 +1,8 @@
 # Deck Snapshot Source — v0.1.8
 
-This public repository contains clean source snapshots corresponding to published Deck Snapshot releases. The `v0.1.8` tag matches the same version in the [official download repository](https://github.com/Fizzywood/deck-snapshot-releases/releases/tag/v0.1.8).
+This public repository contains clean source snapshots corresponding to published Deck Snapshot releases. The `v0.1.8` tag matches the same version in the [official download repository](https://github.com/TAndrson/deck-snapshot-releases/releases/tag/v0.1.8).
 
-**[Download Deck Snapshot](https://github.com/Fizzywood/deck-snapshot-releases/releases/latest)**
+**[Download Deck Snapshot](https://github.com/TAndrson/deck-snapshot-releases/releases/latest)**
 
 Deck Snapshot is a local-first SteamOS tool for backing up and safely restoring supported Decky plugin state, CSS Loader customization, and custom Steam artwork. It is not a system image or a general-purpose backup tool.
 
@@ -24,7 +24,7 @@ The release binary additionally receives Google's non-confidential Desktop insta
 
 This is a release-source snapshot, not the private development repository. It intentionally excludes private history, issues, pull requests, internal coordination, hardware evidence, credentials, tokens, recovery material, real snapshots, and user data. The source, tests, security contract, packaging scripts, and user documentation needed to inspect and build the released product are included.
 
-Distribution assets, checksums, installation instructions, and release notes are published at [Fizzywood/deck-snapshot-releases](https://github.com/Fizzywood/deck-snapshot-releases).
+Distribution assets, checksums, installation instructions, and release notes are published at [TAndrson/deck-snapshot-releases](https://github.com/TAndrson/deck-snapshot-releases).
 
 `SOURCE_VERSION` records the matching public release tag. `SOURCE_PROVENANCE` records that version and the exact private release commit used to generate this clean source snapshot, without exposing private Git history.
 
